@@ -1,0 +1,9 @@
+Nightingale Care Note - third-party attribution
+
+FastAPI - MIT License - https://github.com/fastapi/fastapi
+Uvicorn - BSD 3-Clause License - https://github.com/encode/uvicorn
+Pydantic - MIT License - https://github.com/pydantic/pydantic
+Pytest (development only) - MIT License - https://github.com/pytest-dev/pytest
+Ruff (development only) - MIT License - https://github.com/astral-sh/ruff
+
+No external model is integrated in the current scaffold.

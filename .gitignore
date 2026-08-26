@@ -14,6 +14,7 @@ yarn-error.log
 __pycache__/
 *.py[cod]
 venv/
+.venv/
 
 # IDEs
 .vscode/
@@ -26,3 +27,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local planning materials (intentionally not published)
+INTRODUCTION.md
+docs/IMPLEMENTATION_FLOW.md

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nightingale Care Note</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Nightingale home">
+        <span class="brand-mark">N</span>
+        <span>Nightingale</span>
+      </a>
+      <div class="view-context">
+        <span class="context-dot" aria-hidden="true"></span>
+        Clinician view · Synthetic demo
+      </div>
+    </header>
+
+    <main class="shell" aria-live="polite">
+      <header id="patient-header" class="patient-header" aria-labelledby="patient-name" aria-busy="true">
+        <div class="patient-avatar" aria-hidden="true">MC</div>
+        <div class="patient-identity">
+          <div class="identity-labels">
+            <span class="synthetic-badge">SYNTHETIC PATIENT</span>
+            <span id="patient-pronouns">—</span>
+          </div>
+          <h1 id="patient-name">Loading patient record…</h1>
+          <dl class="patient-meta">
+            <div>
+              <dt>MRN</dt>
+              <dd id="patient-mrn">—</dd>
+            </div>
+            <div>
+              <dt>Date of birth</dt>
+              <dd id="patient-dob">—</dd>
+            </div>
+            <div>
+              <dt>Record scope</dt>
+              <dd>Longitudinal care note</dd>
+            </div>
+          </dl>
+        </div>
+      </header>
+
+      <section id="screen-state" class="screen-state loading" role="status" data-state="loading">
+        <span id="state-icon" class="state-icon" aria-hidden="true"></span>
+        <div>
+          <h2 id="state-title">Loading longitudinal record</h2>
+          <p id="state-message">Securely retrieving patient details, priorities, and timeline.</p>
+        </div>
+        <button id="retry-button" class="retry-button" type="button" hidden>Try again</button>
+      </section>
+
+      <div id="patient-content" hidden>
+        <section class="glance-panel" aria-labelledby="glance-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">10-SECOND GLANCE</p>
+              <h2 id="glance-title">What needs attention now</h2>
+            </div>
+            <p id="highlight-count" class="count-label"></p>
+          </div>
+          <div id="highlight-list" class="highlight-list"></div>
+        </section>
+        <section class="timeline-panel" aria-labelledby="timeline-title">
+          <div class="section-heading timeline-heading">
+            <div>
+              <p class="eyebrow">LONGITUDINAL RECORD</p>
+              <h2 id="timeline-title">Timeline</h2>
+            </div>
+            <p id="entry-count" class="count-label"></p>
+          </div>
+          <div class="timeline-legend" aria-label="Record type legend">
+            <span class="legend-item patient">Patient</span>
+            <span class="legend-item staff">Staff</span>
+            <span class="legend-item clinician">Clinician</span>
+            <span class="legend-item ai">AI-generated</span>
+          </div>
+          <div id="timeline-list" class="timeline-list"></div>
+        </section>
+      </div>
+    </main>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
