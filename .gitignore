@@ -1,0 +1,28 @@
+﻿# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Node
+node_modules/
+dist/
+.env
+npm-debug.log
+yarn-error.log
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
