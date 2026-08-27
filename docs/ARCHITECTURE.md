@@ -8,7 +8,7 @@ rules. Repository adapters handle persistence. The UI is never treated as a secu
 production path uses PostgreSQL, with `clinic_id` present on every patient-scoped table and both
 database RLS and service policies restricting access.
 
-Any external LLM adapter must sit behind an explicit redaction gateway. Logs may contain only
+Any external LLM adapter must sit behind the tested `PHIRedactionGateway`; no external LLM is
+connected in this prototype. Logs may contain only
 safe metadata such as request IDs, latency, and redaction counts; they must never contain patient
 content.
-

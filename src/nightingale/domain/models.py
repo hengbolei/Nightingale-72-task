@@ -109,10 +109,28 @@ class Highlight(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class Comment(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    patient_id: UUID
+    clinic_id: UUID
+    author_id: UUID
+    author_role: Role
+    parent_id: UUID | None = None
+    content: str = Field(min_length=1, max_length=1000)
+    mentions: list[Role] = Field(default_factory=list)
+    assigned_to: Role | None = None
+    resolved: bool = False
+    created_at: datetime = Field(default_factory=utc_now)
+    resolved_at: datetime | None = None
+    resolved_by: UUID | None = None
+
+
 class PatientDetailResponse(BaseModel):
     patient: Patient
     highlights: list[Highlight]
     entries: list[TimelineEntry]
+    sections: list[SectionState] = Field(default_factory=list)
+    comments: list[Comment] = Field(default_factory=list)
 
 
 class SectionRevision(BaseModel):
@@ -122,6 +140,7 @@ class SectionRevision(BaseModel):
     changed_by: UUID
     changed_at: datetime = Field(default_factory=utc_now)
     operation: str = "edit"
+    diff: str | None = None
 
 
 class SectionState(BaseModel):
@@ -131,6 +150,36 @@ class SectionState(BaseModel):
     owner_role: Role
     content: str
     version: int = Field(ge=1)
+
+
+class AuditEvent(BaseModel):
+    patient_id: UUID
+    clinic_id: UUID
+    resource: str
+    resource_id: str
+    version: int = Field(ge=1)
+    operation: str
+    changed_by: UUID
+    changed_at: datetime = Field(default_factory=utc_now)
+
+
+class CommentCreateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=1000)
+    assigned_to: Role | None = None
+    parent_id: UUID | None = None
+
+
+class CommentResolveRequest(BaseModel):
+    resolved: bool
+
+
+class SectionUpdateRequest(BaseModel):
+    content: str = Field(max_length=10000)
+    expected_version: int = Field(ge=0)
+
+
+class SectionRevertRequest(BaseModel):
+    target_version: int = Field(ge=1)
 
 
 class HealthResponse(BaseModel):

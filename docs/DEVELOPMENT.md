@@ -54,6 +54,7 @@ Run the automated test suite and static checks directly:
 .\.venv\Scripts\ruff.exe format --check src tests
 node --check src/nightingale/static/api.js
 node --check src/nightingale/static/app.js
+.\.venv\Scripts\python.exe scripts\benchmark_glance.py --iterations 1000 --warmup 100
 ```
 
 ## Current security boundary

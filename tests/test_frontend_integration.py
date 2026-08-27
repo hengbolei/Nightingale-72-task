@@ -20,9 +20,14 @@ def test_patient_page_serves_accessible_app_shell_and_modules():
     assert 'id="screen-state"' in page.text
     assert 'id="highlight-list"' in page.text
     assert 'id="timeline-list"' in page.text
+    assert 'id="workspace-panel"' in page.text
+    assert 'id="save-section"' in page.text
+    assert 'id="comment-list"' in page.text
     assert 'type="module" src="/static/app.js"' in page.text
     assert "/api/patients/${context.patientId}" in api_module.text
     assert '"x-actor-role": context.actorRole' in api_module.text
+    assert "/sections/${section}/revisions" in api_module.text
+    assert "/comments/${commentId}" in api_module.text
 
 
 def test_patient_api_supplies_every_field_required_by_frontend():

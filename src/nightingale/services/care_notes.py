@@ -1,7 +1,11 @@
+import re
+from difflib import unified_diff
 from uuid import UUID
 
 from nightingale.domain.models import (
     Actor,
+    AuditEvent,
+    Comment,
     EntryType,
     Highlight,
     PatientDetailResponse,
@@ -47,13 +51,92 @@ class CareNoteService:
                 item for item in entries if not item.internal and item.type not in AI_ENTRY_TYPES
             ]
             highlights: list[Highlight] = []
+            sections: list[SectionState] = []
+            comments: list[Comment] = []
         else:
             highlights = self.repository.list_highlights(patient_id)
+            sections = self.repository.list_sections(patient_id, actor.clinic_id)
+            comments = self.repository.list_comments(patient_id, actor.clinic_id)
         return PatientDetailResponse(
             patient=patient,
             highlights=highlights,
             entries=entries,
+            sections=sections,
+            comments=comments,
         )
+
+    def add_comment(
+        self,
+        actor: Actor,
+        patient_id: UUID,
+        content: str,
+        assigned_to: Role | None = None,
+        parent_id: UUID | None = None,
+    ) -> Comment:
+        self._require_internal_collaborator(actor)
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        mentions = [
+            role
+            for role in (Role.STAFF, Role.CLINICIAN, Role.ADMIN)
+            if re.search(rf"(?<!\w)@{role.value}\b", content, flags=re.IGNORECASE)
+        ]
+        if assigned_to is Role.PATIENT or assigned_to is Role.SYSTEM:
+            raise AccessDeniedError("comments can only be assigned to an internal care role")
+        if parent_id is not None:
+            parent = self.repository.get_comment(parent_id)
+            if (
+                parent is None
+                or parent.patient_id != patient_id
+                or parent.clinic_id != actor.clinic_id
+            ):
+                raise LookupError("parent comment does not exist")
+        return self.repository.add_comment(
+            Comment(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                author_id=actor.id,
+                author_role=actor.role,
+                parent_id=parent_id,
+                content=content,
+                mentions=mentions,
+                assigned_to=assigned_to,
+            )
+        )
+
+    def set_comment_resolved(
+        self, actor: Actor, patient_id: UUID, comment_id: UUID, resolved: bool
+    ) -> Comment:
+        self._require_internal_collaborator(actor)
+        comment = self.repository.get_comment(comment_id)
+        if (
+            comment is None
+            or comment.patient_id != patient_id
+            or comment.clinic_id != actor.clinic_id
+        ):
+            raise LookupError("comment does not exist")
+        from nightingale.domain.models import utc_now
+
+        updated = comment.model_copy(
+            update={
+                "resolved": resolved,
+                "resolved_at": utc_now() if resolved else None,
+                "resolved_by": actor.id if resolved else None,
+            }
+        )
+        return self.repository.save_comment(updated)
+
+    def list_revisions(self, actor: Actor, patient_id: UUID, section: str) -> list[SectionRevision]:
+        self._require_internal_collaborator(actor)
+        current = self.repository.get_section(patient_id, section)
+        if current is None or current.clinic_id != actor.clinic_id:
+            raise LookupError("section does not exist")
+        return self.repository.list_revisions(patient_id, section)
+
+    @staticmethod
+    def _require_internal_collaborator(actor: Actor) -> None:
+        if actor.role not in {Role.STAFF, Role.CLINICIAN, Role.ADMIN}:
+            raise AccessDeniedError("internal collaboration requires a care-team role")
 
     def add_entry(self, actor: Actor, entry: TimelineEntry) -> TimelineEntry:
         if actor.clinic_id != entry.clinic_id:
@@ -104,8 +187,29 @@ class CareNoteService:
             version=next_version,
             content=content,
             changed_by=actor.id,
+            diff="\n".join(
+                unified_diff(
+                    (current.content if current else "").splitlines(),
+                    content.splitlines(),
+                    fromfile=f"{section}@{current_version}",
+                    tofile=f"{section}@{next_version}",
+                    lineterm="",
+                )
+            ),
         )
-        return self.repository.save_section(state, revision)
+        saved = self.repository.save_section(state, revision)
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="section",
+                resource_id=section,
+                version=next_version,
+                operation="edit",
+                changed_by=actor.id,
+            )
+        )
+        return saved
 
     def revert_section(
         self, actor: Actor, patient_id: UUID, section: str, target_version: int
@@ -128,4 +232,13 @@ class CareNoteService:
         )
         revisions = self.repository.revisions[(patient_id, section)]
         revisions[-1] = revisions[-1].model_copy(update={"operation": "revert"})
+        self.repository.audit_events[-1] = self.repository.audit_events[-1].model_copy(
+            update={"operation": "revert"}
+        )
         return state
+
+    def list_audit_events(self, actor: Actor, patient_id: UUID) -> list[AuditEvent]:
+        self._require_internal_collaborator(actor)
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        return self.repository.list_audit_events(patient_id, actor.clinic_id)

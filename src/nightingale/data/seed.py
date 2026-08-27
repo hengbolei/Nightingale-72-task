@@ -10,6 +10,8 @@ from nightingale.domain.models import (
     ProvenanceSource,
     ReviewStatus,
     Role,
+    SectionRevision,
+    SectionState,
     TimelineEntry,
 )
 from nightingale.repositories.memory import InMemoryCareNoteRepository
@@ -219,3 +221,28 @@ def seed_demo_data(repository: InMemoryCareNoteRepository) -> None:
     ]
     for highlight in highlights:
         repository.add_highlight(highlight)
+
+    if repository.get_section(patient.id, "plan") is None:
+        repository.save_section(
+            SectionState(
+                patient_id=patient.id,
+                clinic_id=patient.clinic_id,
+                section="plan",
+                owner_role=Role.CLINICIAN,
+                content=(
+                    "Hold morning lisinopril pending review. Repeat blood pressure within "
+                    "48 hours and reassess dizziness."
+                ),
+                version=1,
+            ),
+            SectionRevision(
+                section="plan",
+                version=1,
+                content=(
+                    "Hold morning lisinopril pending review. Repeat blood pressure within "
+                    "48 hours and reassess dizziness."
+                ),
+                changed_by=DEMO_CLINICIAN_ID,
+                operation="seed",
+            ),
+        )

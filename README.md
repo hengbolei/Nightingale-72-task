@@ -18,6 +18,9 @@ human-authored notes, source evidence, and access boundaries explicit.
 - Patient-facing filtering that excludes internal highlights and raw AI-scribed entries.
 - Deterministic section versioning, audit metadata, revert behavior, and optimistic concurrency
   checks.
+- Internal care-team comments with reply links, role mentions, assignment, and resolve/reopen.
+- Editable clinician plan with API-backed revision history and revert controls.
+- A tested PHI redaction gateway for any future external model adapter.
 - Deterministic synthetic data for repeatable demonstrations and tests.
 - Responsive, English-only web interface with loading, empty, forbidden, not-found, and error
   states.
@@ -81,6 +84,7 @@ Run static and formatting checks:
 .\.venv\Scripts\ruff.exe format --check src tests
 node --check src/nightingale/static/api.js
 node --check src/nightingale/static/app.js
+.\.venv\Scripts\python.exe scripts\benchmark_glance.py --iterations 1000 --warmup 100
 ```
 
 The required acceptance scenarios are organized in:
@@ -112,17 +116,18 @@ Implemented in the prototype:
 - Server-side clinic scope and role ownership checks.
 - Patient self-access restriction.
 - Patient response filtering for internal and raw AI content.
-- Metadata-only revision records.
+- Full section snapshots and diffs, with a separate metadata-only audit event stream.
+- Deterministic PHI redaction gateway for future LLM adapters.
+- Reproducible Glance benchmark: 1.005 ms warm-path P95 in the recorded local run.
 
 Required before production:
 
 - Replace development headers with verified signed identity tokens.
 - Replace the in-memory adapter with PostgreSQL and database RLS.
-- Implement and test a PHI redaction gateway before any LLM call.
 - Add TLS, encryption at rest, secret management, retention policies, and production audit
   controls.
-- Perform a documented warm-path P95 measurement for the Glance endpoint against a representative
-  dataset. The `<= 300 ms` target has not yet been benchmarked.
+- Repeat Glance load testing with a production-like database, network, concurrency, and
+  representative dataset; the local in-memory result is not a capacity claim.
 
 No external LLM is connected in the current scaffold, so no patient content is sent to a model.
 
@@ -145,6 +150,10 @@ docs/              Architecture and development documentation
 
 - `docs/ARCHITECTURE.md`
 - `docs/DEVELOPMENT.md`
+- `docs/TECHNICAL_BRIEF.md`
+- `docs/DEMO_SCRIPT.md`
+- `docs/DELIVERY_CHECKLIST.md`
+- `docs/PERFORMANCE.md`
 - `ATTRIBUTION.txt`
 
 ## License

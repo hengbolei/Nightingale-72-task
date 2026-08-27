@@ -80,6 +80,55 @@
           </div>
           <div id="timeline-list" class="timeline-list"></div>
         </section>
+        <section id="workspace-panel" class="workspace-panel" aria-labelledby="workspace-title">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">CARE-TEAM WORKSPACE</p>
+              <h2 id="workspace-title">Plan, review and handoff</h2>
+            </div>
+            <p class="count-label">Internal only</p>
+          </div>
+          <div class="workspace-grid">
+            <article class="workspace-card">
+              <div class="workspace-card-heading">
+                <div>
+                  <p class="eyebrow">CLINICIAN SECTION</p>
+                  <h3>Care plan</h3>
+                </div>
+                <span id="section-version" class="version-label">Version —</span>
+              </div>
+              <textarea id="section-content" rows="6" aria-label="Care plan content"></textarea>
+              <div class="form-actions">
+                <button id="save-section" class="primary-button" type="button">Save new version</button>
+                <button id="show-history" class="secondary-button" type="button">Refresh history</button>
+              </div>
+              <p id="section-feedback" class="form-feedback" role="status"></p>
+              <div id="revision-list" class="revision-list" aria-label="Care plan revision history"></div>
+            </article>
+            <article class="workspace-card">
+              <div class="workspace-card-heading">
+                <div>
+                  <p class="eyebrow">THREADED HANDOFF</p>
+                  <h3>Care-team comments</h3>
+                </div>
+                <span id="comment-count" class="version-label"></span>
+              </div>
+              <label class="field-label" for="comment-content">New comment</label>
+              <textarea id="comment-content" rows="3" placeholder="Try @staff or @clinician…"></textarea>
+              <label class="field-label" for="comment-assignee">Assign follow-up</label>
+              <select id="comment-assignee">
+                <option value="">Unassigned</option>
+                <option value="staff">Staff</option>
+                <option value="clinician">Clinician</option>
+              </select>
+              <div class="form-actions">
+                <button id="add-comment" class="primary-button" type="button">Add comment</button>
+              </div>
+              <p id="comment-feedback" class="form-feedback" role="status"></p>
+              <div id="comment-list" class="comment-list"></div>
+            </article>
+          </div>
+        </section>
       </div>
     </main>
     <script type="module" src="/static/app.js"></script>

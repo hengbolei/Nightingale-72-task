@@ -1,6 +1,8 @@
 from uuid import UUID
 
 from nightingale.domain.models import (
+    AuditEvent,
+    Comment,
     Highlight,
     Patient,
     SectionRevision,
@@ -18,6 +20,8 @@ class InMemoryCareNoteRepository:
         self.highlights: dict[UUID, Highlight] = {}
         self.sections: dict[tuple[UUID, str], SectionState] = {}
         self.revisions: dict[tuple[UUID, str], list[SectionRevision]] = {}
+        self.comments: dict[UUID, Comment] = {}
+        self.audit_events: list[AuditEvent] = []
 
     def add_patient(self, patient: Patient) -> Patient:
         self.patients[patient.id] = patient
@@ -71,3 +75,46 @@ class InMemoryCareNoteRepository:
 
     def list_revisions(self, patient_id: UUID, section: str) -> list[SectionRevision]:
         return list(self.revisions.get((patient_id, section), []))
+
+    def list_sections(self, patient_id: UUID, clinic_id: UUID) -> list[SectionState]:
+        return sorted(
+            (
+                state
+                for state in self.sections.values()
+                if state.patient_id == patient_id and state.clinic_id == clinic_id
+            ),
+            key=lambda state: state.section,
+        )
+
+    def add_comment(self, comment: Comment) -> Comment:
+        self.comments[comment.id] = comment
+        return comment
+
+    def get_comment(self, comment_id: UUID) -> Comment | None:
+        return self.comments.get(comment_id)
+
+    def save_comment(self, comment: Comment) -> Comment:
+        self.comments[comment.id] = comment
+        return comment
+
+    def list_comments(self, patient_id: UUID, clinic_id: UUID) -> list[Comment]:
+        return sorted(
+            (
+                comment
+                for comment in self.comments.values()
+                if comment.patient_id == patient_id and comment.clinic_id == clinic_id
+            ),
+            key=lambda comment: comment.created_at,
+            reverse=True,
+        )
+
+    def add_audit_event(self, event: AuditEvent) -> AuditEvent:
+        self.audit_events.append(event)
+        return event
+
+    def list_audit_events(self, patient_id: UUID, clinic_id: UUID) -> list[AuditEvent]:
+        return [
+            event
+            for event in self.audit_events
+            if event.patient_id == patient_id and event.clinic_id == clinic_id
+        ]

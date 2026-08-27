@@ -1,4 +1,12 @@
-import { ApiError, getPatientDetail } from "/static/api.js";
+import {
+  ApiError,
+  addComment,
+  getPatientDetail,
+  getSectionRevisions,
+  revertSection,
+  setCommentResolved,
+  updateSection,
+} from "/static/api.js";
 
 const elements = {
   name: document.querySelector("#patient-name"),
@@ -15,7 +23,22 @@ const elements = {
   stateTitle: document.querySelector("#state-title"),
   stateMessage: document.querySelector("#state-message"),
   retryButton: document.querySelector("#retry-button"),
+  sectionContent: document.querySelector("#section-content"),
+  sectionVersion: document.querySelector("#section-version"),
+  saveSection: document.querySelector("#save-section"),
+  showHistory: document.querySelector("#show-history"),
+  sectionFeedback: document.querySelector("#section-feedback"),
+  revisionList: document.querySelector("#revision-list"),
+  commentContent: document.querySelector("#comment-content"),
+  commentAssignee: document.querySelector("#comment-assignee"),
+  addComment: document.querySelector("#add-comment"),
+  commentFeedback: document.querySelector("#comment-feedback"),
+  commentList: document.querySelector("#comment-list"),
+  commentCount: document.querySelector("#comment-count"),
 };
+
+let currentPlanVersion = 0;
+let replyToCommentId = null;
 
 const screenStates = {
   loading: ["Loading longitudinal record", "Securely retrieving patient details, priorities, and timeline."],
@@ -146,6 +169,27 @@ function renderHighlights(highlights) {
     );
     body.append(footer);
     card.append(priority, body);
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-label", `Open source for ${highlight.text}`);
+    const openSource = () => {
+      const target = document.querySelector(
+        `#entry-${highlight.provenance_pointer.entry_id}`,
+      );
+      if (!target) return;
+      document.querySelectorAll(".source-target").forEach((node) => {
+        node.classList.remove("source-target");
+      });
+      target.classList.add("source-target");
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+    };
+    card.addEventListener("click", openSource);
+    card.addEventListener("keydown", (event) => {
+      if (["Enter", " "].includes(event.key)) {
+        event.preventDefault();
+        openSource();
+      }
+    });
     elements.highlightList.append(card);
   });
 }
@@ -198,6 +242,111 @@ function renderTimeline(entries) {
   });
 }
 
+function renderSection(sections) {
+  const plan = sections.find((section) => section.section === "plan");
+  currentPlanVersion = plan?.version || 0;
+  elements.sectionContent.value = plan?.content || "";
+  elements.sectionVersion.textContent = `Version ${currentPlanVersion}`;
+}
+
+function renderComments(comments) {
+  elements.commentList.replaceChildren();
+  elements.commentCount.textContent = `${comments.length} comment${comments.length === 1 ? "" : "s"}`;
+  comments.forEach((comment) => {
+    const item = createElement(
+      "article",
+      `comment-item${comment.resolved ? " resolved" : ""}${comment.parent_id ? " reply" : ""}`,
+    );
+    const meta = createElement("div", "comment-meta");
+    meta.append(
+      createElement(
+        "span",
+        "",
+        `${roleLabels[comment.author_role] || comment.author_role} · ${formatDateTime(comment.created_at)}`,
+      ),
+    );
+    const toggle = createElement(
+      "button",
+      "text-button",
+      comment.resolved ? "Reopen" : "Resolve",
+    );
+    toggle.type = "button";
+    toggle.addEventListener("click", async () => {
+      try {
+        await setCommentResolved(comment.id, !comment.resolved);
+        await loadPatient();
+      } catch (error) {
+        showFeedback(elements.commentFeedback, error.message, true);
+      }
+    });
+    const reply = createElement("button", "text-button", "Reply");
+    reply.type = "button";
+    reply.addEventListener("click", () => {
+      replyToCommentId = comment.id;
+      elements.commentContent.focus();
+      showFeedback(elements.commentFeedback, "Your next comment will be added as a reply.");
+    });
+    const controls = createElement("span", "comment-controls");
+    controls.append(reply, toggle);
+    meta.append(controls);
+    item.append(meta, createElement("p", "comment-content", comment.content));
+    comment.mentions.forEach((mention) => {
+      item.append(createElement("span", "mention-chip", `@${mention}`));
+    });
+    if (comment.assigned_to) {
+      item.append(
+        createElement("span", "assignment-chip", `Assigned: ${comment.assigned_to}`),
+      );
+    }
+    elements.commentList.append(item);
+  });
+}
+
+function showFeedback(element, message, isError = false) {
+  element.textContent = message;
+  element.classList.toggle("error", isError);
+}
+
+async function renderHistory() {
+  try {
+    const revisions = await getSectionRevisions("plan");
+    elements.revisionList.replaceChildren();
+    [...revisions].reverse().forEach((revision, index) => {
+      const item = createElement("article", "revision-item");
+      const meta = createElement("div", "revision-meta");
+      meta.append(
+        createElement(
+          "span",
+          "",
+          `Version ${revision.version} · ${revision.operation} · ${formatDateTime(revision.changed_at)}`,
+        ),
+      );
+      if (index > 0) {
+        const button = createElement("button", "text-button", "Revert to this");
+        button.type = "button";
+        button.addEventListener("click", async () => {
+          try {
+            await revertSection("plan", revision.version);
+            showFeedback(elements.sectionFeedback, `Reverted to version ${revision.version}.`);
+            await loadPatient();
+            await renderHistory();
+          } catch (error) {
+            showFeedback(elements.sectionFeedback, error.message, true);
+          }
+        });
+        meta.append(button);
+      }
+      item.append(meta, createElement("p", "revision-content", revision.content));
+      if (revision.diff) {
+        item.append(createElement("pre", "revision-diff", revision.diff));
+      }
+      elements.revisionList.append(item);
+    });
+  } catch (error) {
+    showFeedback(elements.sectionFeedback, error.message, true);
+  }
+}
+
 async function loadPatient() {
   setScreenState("loading");
   try {
@@ -205,6 +354,8 @@ async function loadPatient() {
     renderPatient(detail.patient);
     renderHighlights(detail.highlights);
     renderTimeline(detail.entries);
+    renderSection(detail.sections || []);
+    renderComments(detail.comments || []);
     const isEmpty = detail.highlights.length === 0 && detail.entries.length === 0;
     setScreenState(isEmpty ? "empty" : "ready");
     return detail;
@@ -223,4 +374,38 @@ async function loadPatient() {
 }
 
 elements.retryButton.addEventListener("click", loadPatient);
+elements.saveSection.addEventListener("click", async () => {
+  showFeedback(elements.sectionFeedback, "Saving…");
+  try {
+    const section = await updateSection(
+      "plan",
+      elements.sectionContent.value,
+      currentPlanVersion,
+    );
+    currentPlanVersion = section.version;
+    elements.sectionVersion.textContent = `Version ${section.version}`;
+    showFeedback(elements.sectionFeedback, `Saved version ${section.version}.`);
+    await renderHistory();
+  } catch (error) {
+    showFeedback(elements.sectionFeedback, error.message, true);
+  }
+});
+elements.showHistory.addEventListener("click", renderHistory);
+elements.addComment.addEventListener("click", async () => {
+  const content = elements.commentContent.value.trim();
+  if (!content) {
+    showFeedback(elements.commentFeedback, "Enter a comment first.", true);
+    return;
+  }
+  try {
+    await addComment(content, elements.commentAssignee.value, replyToCommentId);
+    replyToCommentId = null;
+    elements.commentContent.value = "";
+    elements.commentAssignee.value = "";
+    showFeedback(elements.commentFeedback, "Comment added.");
+    await loadPatient();
+  } catch (error) {
+    showFeedback(elements.commentFeedback, error.message, true);
+  }
+});
 loadPatient();
