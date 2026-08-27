@@ -5,5 +5,6 @@ Uvicorn - BSD 3-Clause License - https://github.com/encode/uvicorn
 Pydantic - MIT License - https://github.com/pydantic/pydantic
 Pytest (development only) - MIT License - https://github.com/pytest-dev/pytest
 Ruff (development only) - MIT License - https://github.com/astral-sh/ruff
+HTTPX (development only) - BSD 3-Clause License - https://github.com/encode/httpx
 
 No external model is integrated in the current scaffold.

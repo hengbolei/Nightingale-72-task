@@ -41,6 +41,22 @@ def test_comment_mention_assignment_and_resolution_round_trip():
     assert resolved.status_code == 200
     assert resolved.json()["resolved"] is True
 
+    reopened = client.patch(
+        f"/api/patients/{DEMO_PATIENT_ID}/comments/{comment['id']}",
+        headers=_headers(),
+        json={"resolved": False},
+    )
+    assert reopened.status_code == 200
+    assert reopened.json()["resolved"] is False
+
+    audit = client.get(f"/api/patients/{DEMO_PATIENT_ID}/audit", headers=_headers())
+    assert [event["operation"] for event in audit.json()[-4:]] == [
+        "comment_create",
+        "comment_reply",
+        "comment_resolve",
+        "comment_reopen",
+    ]
+
 
 def test_section_edit_history_and_revert_round_trip():
     detail = client.get(f"/api/patients/{DEMO_PATIENT_ID}", headers=_headers()).json()

@@ -28,6 +28,17 @@ def test_patient_page_serves_accessible_app_shell_and_modules():
     assert '"x-actor-role": context.actorRole' in api_module.text
     assert "/sections/${section}/revisions" in api_module.text
     assert "/comments/${commentId}" in api_module.text
+    assert "/highlights/${highlightId}" in api_module.text
+    assert "/patients/${context.patientId}/entries" in api_module.text
+    assert "/patients/${context.patientId}/highlights" in api_module.text
+    assert "/patients/${context.patientId}/audit" in api_module.text
+    assert 'id="demo-role"' in page.text
+    assert 'id="staff-note-card"' in page.text
+    assert 'id="highlight-composer-card"' in page.text
+    assert 'id="audit-list"' in page.text
+    assert 'id="patient-dashboard"' in page.text
+    assert 'id="patient-action-list"' in page.text
+    assert 'id="add-patient-entry"' in page.text
 
 
 def test_patient_api_supplies_every_field_required_by_frontend():
@@ -57,6 +68,9 @@ def test_patient_api_supplies_every_field_required_by_frontend():
             "priority",
             "status",
             "provenance_pointer",
+            "assigned_to",
+            "action_status",
+            "version",
         }
         <= highlight.keys()
         for highlight in body["highlights"]

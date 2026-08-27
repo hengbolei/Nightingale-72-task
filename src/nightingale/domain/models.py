@@ -37,6 +37,12 @@ class ReviewStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class ActionStatus(StrEnum):
+    OPEN = "open"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+
 class ProvenanceSource(StrEnum):
     MANUAL_ENTRY = "manual_entry"
     PATIENT_SESSION = "patient_session"
@@ -103,10 +109,26 @@ class Highlight(BaseModel):
     text: str
     risk_reason: str
     suggested_action: str = Field(min_length=1, max_length=240)
+    patient_instruction: str | None = Field(default=None, max_length=500)
     priority: int = Field(ge=0, le=100)
     status: ReviewStatus
     provenance_pointer: ProvenancePointer
+    assigned_to: Role | None = None
+    action_status: ActionStatus = ActionStatus.OPEN
+    disposition_note: str | None = Field(default=None, max_length=1000)
+    version: int = Field(default=1, ge=1)
+    updated_by: UUID | None = None
+    updated_at: datetime | None = None
+    completed_by: UUID | None = None
+    completed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class PatientAction(BaseModel):
+    title: str
+    instruction: str
+    action_status: ActionStatus
+    updated_at: datetime
 
 
 class Comment(BaseModel):
@@ -123,12 +145,14 @@ class Comment(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     resolved_at: datetime | None = None
     resolved_by: UUID | None = None
+    version: int = Field(default=1, ge=1)
 
 
 class PatientDetailResponse(BaseModel):
     patient: Patient
     highlights: list[Highlight]
     entries: list[TimelineEntry]
+    patient_actions: list[PatientAction] = Field(default_factory=list)
     sections: list[SectionState] = Field(default_factory=list)
     comments: list[Comment] = Field(default_factory=list)
 
@@ -171,6 +195,37 @@ class CommentCreateRequest(BaseModel):
 
 class CommentResolveRequest(BaseModel):
     resolved: bool
+
+
+class TimelineEntryCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    content: str = Field(min_length=1, max_length=10000)
+
+
+class HighlightCreateRequest(BaseModel):
+    entry_id: UUID
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    risk_reason: str = Field(min_length=1, max_length=500)
+    suggested_action: str = Field(min_length=1, max_length=240)
+    patient_instruction: str | None = Field(default=None, max_length=500)
+    priority: int = Field(ge=0, le=100)
+    status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
+    assigned_to: Role | None = None
+
+    @model_validator(mode="after")
+    def validate_span(self) -> HighlightCreateRequest:
+        if self.end <= self.start:
+            raise ValueError("highlight end must be greater than start")
+        return self
+
+
+class HighlightUpdateRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    status: ReviewStatus | None = None
+    assigned_to: Role | None = None
+    action_status: ActionStatus | None = None
+    disposition_note: str | None = Field(default=None, max_length=1000)
 
 
 class SectionUpdateRequest(BaseModel):

@@ -38,6 +38,7 @@ def _highlight(
     suggested_action: str,
     priority: int,
     status: ReviewStatus,
+    patient_instruction: str | None = None,
 ) -> Highlight:
     start = entry.content.index(text)
     return Highlight(
@@ -46,6 +47,7 @@ def _highlight(
         text=text,
         risk_reason=risk_reason,
         suggested_action=suggested_action,
+        patient_instruction=patient_instruction,
         priority=priority,
         status=status,
         provenance_pointer=ProvenancePointer(
@@ -199,6 +201,7 @@ def seed_demo_data(repository: InMemoryCareNoteRepository) -> None:
             "Confirm the hold instruction with the patient",
             100,
             ReviewStatus.CLINICIAN_CONFIRMED,
+            "Follow the clinician's instruction to hold the morning lisinopril until review.",
         ),
         _highlight(
             UUID("60000000-0000-4000-8000-000000000002"),
@@ -208,6 +211,7 @@ def seed_demo_data(repository: InMemoryCareNoteRepository) -> None:
             "Repeat blood pressure and assess symptoms",
             92,
             ReviewStatus.AI_SUGGESTED,
+            "Repeat your blood pressure reading and record any symptoms.",
         ),
         _highlight(
             UUID("60000000-0000-4000-8000-000000000003"),

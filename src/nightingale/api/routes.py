@@ -11,12 +11,17 @@ from nightingale.domain.models import (
     CommentCreateRequest,
     CommentResolveRequest,
     HealthResponse,
+    Highlight,
+    HighlightCreateRequest,
+    HighlightUpdateRequest,
     PatientDetailResponse,
     Role,
     SectionRevertRequest,
     SectionRevision,
     SectionState,
     SectionUpdateRequest,
+    TimelineEntry,
+    TimelineEntryCreateRequest,
 )
 from nightingale.repositories.memory import InMemoryCareNoteRepository
 from nightingale.services.care_notes import (
@@ -50,6 +55,8 @@ def translate_service_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, ConcurrentEditError):
         return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
     return HTTPException(status_code=404, detail=str(exc))
 
 
@@ -85,6 +92,30 @@ def create_comment(
         raise translate_service_error(exc) from exc
 
 
+@router.post("/patients/{patient_id}/entries", response_model=TimelineEntry, status_code=201)
+def create_timeline_entry(
+    patient_id: UUID,
+    payload: TimelineEntryCreateRequest,
+    actor: ActorDependency,
+) -> TimelineEntry:
+    try:
+        return service.create_manual_entry(actor, patient_id, payload.title, payload.content)
+    except (PatientNotFoundError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.post("/patients/{patient_id}/highlights", response_model=Highlight, status_code=201)
+def create_highlight(
+    patient_id: UUID,
+    payload: HighlightCreateRequest,
+    actor: ActorDependency,
+) -> Highlight:
+    try:
+        return service.create_highlight(actor, patient_id, payload)
+    except (PatientNotFoundError, LookupError, PermissionError, ValueError) as exc:
+        raise translate_service_error(exc) from exc
+
+
 @router.patch("/patients/{patient_id}/comments/{comment_id}", response_model=Comment)
 def resolve_comment(
     patient_id: UUID,
@@ -95,6 +126,24 @@ def resolve_comment(
     try:
         return service.set_comment_resolved(actor, patient_id, comment_id, payload.resolved)
     except (LookupError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.patch("/patients/{patient_id}/highlights/{highlight_id}", response_model=Highlight)
+def update_highlight(
+    patient_id: UUID,
+    highlight_id: UUID,
+    payload: HighlightUpdateRequest,
+    actor: ActorDependency,
+) -> Highlight:
+    try:
+        return service.update_highlight(actor, patient_id, highlight_id, payload)
+    except (
+        PatientNotFoundError,
+        LookupError,
+        PermissionError,
+        ConcurrentEditError,
+    ) as exc:
         raise translate_service_error(exc) from exc
 
 

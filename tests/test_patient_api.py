@@ -42,6 +42,14 @@ def test_patient_response_does_not_expose_internal_ai_content():
     assert body["highlights"] == []
     assert len(body["entries"]) == 1
     assert body["entries"][0]["internal"] is False
+    assert len(body["patient_actions"]) == 1
+    assert set(body["patient_actions"][0]) == {
+        "title",
+        "instruction",
+        "action_status",
+        "updated_at",
+    }
+    assert "lisinopril" in body["patient_actions"][0]["instruction"]
 
 
 def test_cross_clinic_patient_is_not_discoverable():

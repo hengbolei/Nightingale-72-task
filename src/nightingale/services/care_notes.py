@@ -1,18 +1,27 @@
 import re
 from difflib import unified_diff
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from nightingale.domain.models import (
+    ActionStatus,
     Actor,
     AuditEvent,
     Comment,
+    EntryOrigin,
     EntryType,
     Highlight,
+    HighlightCreateRequest,
+    HighlightUpdateRequest,
+    PatientAction,
     PatientDetailResponse,
+    ProvenancePointer,
+    ProvenanceSource,
+    ReviewStatus,
     Role,
     SectionRevision,
     SectionState,
     TimelineEntry,
+    utc_now,
 )
 from nightingale.repositories.memory import InMemoryCareNoteRepository
 
@@ -51,16 +60,29 @@ class CareNoteService:
                 item for item in entries if not item.internal and item.type not in AI_ENTRY_TYPES
             ]
             highlights: list[Highlight] = []
+            patient_actions = [
+                PatientAction(
+                    title=item.text,
+                    instruction=item.patient_instruction,
+                    action_status=item.action_status,
+                    updated_at=item.updated_at or item.created_at,
+                )
+                for item in self.repository.list_highlights(patient_id)
+                if item.status is ReviewStatus.CLINICIAN_CONFIRMED
+                and item.patient_instruction is not None
+            ]
             sections: list[SectionState] = []
             comments: list[Comment] = []
         else:
             highlights = self.repository.list_highlights(patient_id)
+            patient_actions = []
             sections = self.repository.list_sections(patient_id, actor.clinic_id)
             comments = self.repository.list_comments(patient_id, actor.clinic_id)
         return PatientDetailResponse(
             patient=patient,
             highlights=highlights,
             entries=entries,
+            patient_actions=patient_actions,
             sections=sections,
             comments=comments,
         )
@@ -91,7 +113,7 @@ class CareNoteService:
                 or parent.clinic_id != actor.clinic_id
             ):
                 raise LookupError("parent comment does not exist")
-        return self.repository.add_comment(
+        saved = self.repository.add_comment(
             Comment(
                 patient_id=patient_id,
                 clinic_id=actor.clinic_id,
@@ -103,6 +125,18 @@ class CareNoteService:
                 assigned_to=assigned_to,
             )
         )
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="comment",
+                resource_id=str(saved.id),
+                version=saved.version,
+                operation="comment_reply" if parent_id is not None else "comment_create",
+                changed_by=actor.id,
+            )
+        )
+        return saved
 
     def set_comment_resolved(
         self, actor: Actor, patient_id: UUID, comment_id: UUID, resolved: bool
@@ -115,16 +149,201 @@ class CareNoteService:
             or comment.clinic_id != actor.clinic_id
         ):
             raise LookupError("comment does not exist")
-        from nightingale.domain.models import utc_now
-
         updated = comment.model_copy(
             update={
                 "resolved": resolved,
                 "resolved_at": utc_now() if resolved else None,
                 "resolved_by": actor.id if resolved else None,
+                "version": comment.version + 1,
             }
         )
-        return self.repository.save_comment(updated)
+        saved = self.repository.save_comment(updated)
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="comment",
+                resource_id=str(comment_id),
+                version=saved.version,
+                operation="comment_resolve" if resolved else "comment_reopen",
+                changed_by=actor.id,
+            )
+        )
+        return saved
+
+    def update_highlight(
+        self,
+        actor: Actor,
+        patient_id: UUID,
+        highlight_id: UUID,
+        payload: HighlightUpdateRequest,
+    ) -> Highlight:
+        self._require_internal_collaborator(actor)
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        current = self.repository.get_highlight(highlight_id)
+        if current is None or current.patient_id != patient_id:
+            raise LookupError("highlight does not exist")
+        if payload.expected_version != current.version:
+            raise ConcurrentEditError(
+                f"expected version {payload.expected_version}, current version is {current.version}"
+            )
+        if (
+            payload.status is not None
+            and payload.status in {ReviewStatus.CLINICIAN_CONFIRMED, ReviewStatus.REJECTED}
+            and actor.role not in {Role.CLINICIAN, Role.ADMIN}
+        ):
+            raise AccessDeniedError("only clinicians or admins can confirm or reject a highlight")
+        if payload.assigned_to in {Role.PATIENT, Role.SYSTEM}:
+            raise AccessDeniedError("highlights can only be assigned to an internal care role")
+
+        changes = {
+            "version": current.version + 1,
+            "updated_by": actor.id,
+            "updated_at": utc_now(),
+        }
+        for field in ("status", "assigned_to", "action_status", "disposition_note"):
+            if field in payload.model_fields_set:
+                changes[field] = getattr(payload, field)
+        next_action_status = changes.get("action_status", current.action_status)
+        if next_action_status is ActionStatus.COMPLETED:
+            changes["completed_by"] = actor.id
+            changes["completed_at"] = utc_now()
+        elif "action_status" in changes:
+            changes["completed_by"] = None
+            changes["completed_at"] = None
+
+        saved = self.repository.save_highlight(current.model_copy(update=changes))
+        operation = "highlight_update"
+        if payload.action_status is not None and payload.action_status is not current.action_status:
+            operation = (
+                "highlight_complete"
+                if payload.action_status is ActionStatus.COMPLETED
+                else "highlight_action_update"
+            )
+        elif (
+            "assigned_to" in payload.model_fields_set
+            and payload.assigned_to is not current.assigned_to
+        ):
+            operation = (
+                "highlight_assign" if payload.assigned_to is not None else "highlight_unassign"
+            )
+        elif payload.status is not None and payload.status is not current.status:
+            operation = "highlight_review"
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="highlight",
+                resource_id=str(highlight_id),
+                version=saved.version,
+                operation=operation,
+                changed_by=actor.id,
+            )
+        )
+        return saved
+
+    def create_manual_entry(
+        self, actor: Actor, patient_id: UUID, title: str, content: str
+    ) -> TimelineEntry:
+        patient = self.repository.get_patient(patient_id, actor.clinic_id)
+        if patient is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        if actor.role is Role.PATIENT and actor.id != patient_id:
+            raise AccessDeniedError("patients can only write to their own record")
+        entry_types = {
+            Role.PATIENT: EntryType.PATIENT_NOTE,
+            Role.STAFF: EntryType.STAFF_NOTE,
+            Role.CLINICIAN: EntryType.CLINICIAN_NOTE,
+        }
+        entry_type = entry_types.get(actor.role)
+        if entry_type is None:
+            raise AccessDeniedError("this role cannot author a timeline note")
+        entry_id = uuid4()
+        entry = TimelineEntry(
+            id=entry_id,
+            patient_id=patient_id,
+            clinic_id=actor.clinic_id,
+            author_role=actor.role,
+            author_id=actor.id,
+            type=entry_type,
+            title=title,
+            content=content,
+            origin=EntryOrigin(
+                source=ProvenanceSource.MANUAL_ENTRY,
+                source_id=f"manual-note-{entry_id}",
+                source_label=f"{actor.role.value.title()} manual note",
+            ),
+            review_status=(
+                ReviewStatus.CLINICIAN_CONFIRMED if actor.role is Role.CLINICIAN else None
+            ),
+            internal=actor.role is not Role.PATIENT,
+        )
+        saved = self.add_entry(actor, entry)
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="timeline_entry",
+                resource_id=str(saved.id),
+                version=1,
+                operation="entry_create",
+                changed_by=actor.id,
+            )
+        )
+        return saved
+
+    def create_highlight(
+        self,
+        actor: Actor,
+        patient_id: UUID,
+        payload: HighlightCreateRequest,
+    ) -> Highlight:
+        if actor.role is not Role.CLINICIAN:
+            raise AccessDeniedError("only clinicians can create manual highlights")
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        source = self.repository.get_entry(payload.entry_id)
+        if source is None or source.patient_id != patient_id or source.clinic_id != actor.clinic_id:
+            raise LookupError("source entry does not exist")
+        if payload.end > len(source.content):
+            raise ValueError("highlight span is outside the source entry")
+        text = source.content[payload.start : payload.end]
+        if not text.strip():
+            raise ValueError("highlight span must contain visible text")
+        if payload.assigned_to in {Role.PATIENT, Role.SYSTEM}:
+            raise AccessDeniedError("highlights can only be assigned to an internal care role")
+        highlight = self.repository.add_highlight(
+            Highlight(
+                patient_id=patient_id,
+                text=text,
+                risk_reason=payload.risk_reason,
+                suggested_action=payload.suggested_action,
+                patient_instruction=payload.patient_instruction,
+                priority=payload.priority,
+                status=payload.status,
+                assigned_to=payload.assigned_to,
+                provenance_pointer=ProvenancePointer(
+                    entry_id=source.id,
+                    start=payload.start,
+                    end=payload.end,
+                ),
+                updated_by=actor.id,
+                updated_at=utc_now(),
+            )
+        )
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="highlight",
+                resource_id=str(highlight.id),
+                version=highlight.version,
+                operation="highlight_create",
+                changed_by=actor.id,
+            )
+        )
+        return highlight
 
     def list_revisions(self, actor: Actor, patient_id: UUID, section: str) -> list[SectionRevision]:
         self._require_internal_collaborator(actor)

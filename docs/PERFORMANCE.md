@@ -16,10 +16,10 @@ Measured on 2026-08-27 with Python 3.12.10 on the local Windows development envi
 
 | Metric | Result |
 | --- | ---: |
-| Mean | 0.737 ms |
-| P50 | 0.695 ms |
-| P95 | 1.005 ms |
-| Maximum | 8.141 ms |
+| Mean | 0.721 ms |
+| P50 | 0.685 ms |
+| P95 | 0.990 ms |
+| Maximum | 1.621 ms |
 | Prototype target | ≤ 300 ms P95 |
 
 The measured prototype passes its warm-path target. This result does not include a network hop,

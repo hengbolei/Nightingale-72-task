@@ -1,9 +1,21 @@
-export const DEMO_CONTEXT = Object.freeze({
+export const DEMO_IDENTITIES = Object.freeze({
+  clinician: "40000000-0000-4000-8000-000000000001",
+  staff: "30000000-0000-4000-8000-000000000001",
+  patient: "20000000-0000-4000-8000-000000000001",
+});
+
+export const DEMO_CONTEXT = {
   patientId: "20000000-0000-4000-8000-000000000001",
-  actorId: "40000000-0000-4000-8000-000000000001",
+  actorId: DEMO_IDENTITIES.clinician,
   actorRole: "clinician",
   clinicId: "10000000-0000-4000-8000-000000000001",
-});
+};
+
+export function setDemoRole(role) {
+  if (!(role in DEMO_IDENTITIES)) throw new Error("Unknown demo role");
+  DEMO_CONTEXT.actorRole = role;
+  DEMO_CONTEXT.actorId = DEMO_IDENTITIES[role];
+}
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -59,6 +71,31 @@ export function setCommentResolved(commentId, resolved, context = DEMO_CONTEXT) 
     method: "PATCH",
     body: JSON.stringify({ resolved }),
   }, context);
+}
+
+export function updateHighlight(highlightId, changes, context = DEMO_CONTEXT) {
+  return request(`/api/patients/${context.patientId}/highlights/${highlightId}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  }, context);
+}
+
+export function addTimelineEntry(title, content, context = DEMO_CONTEXT) {
+  return request(`/api/patients/${context.patientId}/entries`, {
+    method: "POST",
+    body: JSON.stringify({ title, content }),
+  }, context);
+}
+
+export function createHighlight(payload, context = DEMO_CONTEXT) {
+  return request(`/api/patients/${context.patientId}/highlights`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, context);
+}
+
+export function getAuditEvents(context = DEMO_CONTEXT) {
+  return request(`/api/patients/${context.patientId}/audit`, {}, context);
 }
 
 export function updateSection(section, content, expectedVersion, context = DEMO_CONTEXT) {

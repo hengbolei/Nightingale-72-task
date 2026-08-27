@@ -14,7 +14,12 @@
       </a>
       <div class="view-context">
         <span class="context-dot" aria-hidden="true"></span>
-        Clinician view · Synthetic demo
+        <label for="demo-role">Demo view</label>
+        <select id="demo-role" class="role-switcher" aria-label="Switch demo role">
+          <option value="clinician">Clinician</option>
+          <option value="staff">Staff</option>
+          <option value="patient">Patient</option>
+        </select>
       </div>
     </header>
 
@@ -54,7 +59,35 @@
       </section>
 
       <div id="patient-content" hidden>
-        <section class="glance-panel" aria-labelledby="glance-title">
+        <section id="patient-dashboard" class="patient-dashboard" aria-labelledby="patient-dashboard-title" hidden>
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">YOUR CARE</p>
+              <h2 id="patient-dashboard-title">Your plan and next steps</h2>
+            </div>
+            <p id="patient-action-count" class="count-label"></p>
+          </div>
+          <div class="patient-dashboard-grid">
+            <article class="patient-dashboard-card">
+              <h3>Clinician-confirmed guidance</h3>
+              <p class="helper-text">Only guidance reviewed by your clinical team appears here.</p>
+              <div id="patient-action-list" class="patient-action-list"></div>
+            </article>
+            <article class="patient-dashboard-card">
+              <h3>Share an update</h3>
+              <p class="helper-text">Add a symptom or question for your care team to review.</p>
+              <label class="field-label" for="patient-entry-title">Update title</label>
+              <input id="patient-entry-title" maxlength="160" placeholder="e.g. Morning symptom update" />
+              <label class="field-label" for="patient-entry-content">What would you like the team to know?</label>
+              <textarea id="patient-entry-content" rows="4" maxlength="10000"></textarea>
+              <div class="form-actions">
+                <button id="add-patient-entry" class="primary-button" type="button">Share with care team</button>
+              </div>
+              <p id="patient-entry-feedback" class="form-feedback" role="status"></p>
+            </article>
+          </div>
+        </section>
+        <section id="glance-panel" class="glance-panel" aria-labelledby="glance-title">
           <div class="section-heading">
             <div>
               <p class="eyebrow">10-SECOND GLANCE</p>
@@ -126,6 +159,74 @@
               </div>
               <p id="comment-feedback" class="form-feedback" role="status"></p>
               <div id="comment-list" class="comment-list"></div>
+            </article>
+            <article id="staff-note-card" class="workspace-card" hidden>
+              <div class="workspace-card-heading">
+                <div>
+                  <p class="eyebrow">STAFF ENTRY</p>
+                  <h3>Add timeline note</h3>
+                </div>
+              </div>
+              <label class="field-label" for="entry-title">Note title</label>
+              <input id="entry-title" maxlength="160" placeholder="e.g. Follow-up call" />
+              <label class="field-label" for="entry-content">Note content</label>
+              <textarea id="entry-content" rows="4" maxlength="10000"></textarea>
+              <div class="form-actions">
+                <button id="add-entry" class="primary-button" type="button">Add to timeline</button>
+              </div>
+              <p id="entry-feedback" class="form-feedback" role="status"></p>
+            </article>
+            <article id="highlight-composer-card" class="workspace-card" hidden>
+              <div class="workspace-card-heading">
+                <div>
+                  <p class="eyebrow">CLINICIAN REVIEW</p>
+                  <h3>Create highlight from source</h3>
+                </div>
+              </div>
+              <p class="helper-text">Select text in a Timeline entry, then choose “Use selected text”.</p>
+              <blockquote id="selected-source" class="selected-source">No source text selected.</blockquote>
+              <label class="field-label" for="highlight-reason">Risk reason</label>
+              <input id="highlight-reason" maxlength="500" />
+              <label class="field-label" for="highlight-action">Suggested action</label>
+              <input id="highlight-action" maxlength="240" />
+              <label class="field-label" for="highlight-patient-instruction">Patient-facing instruction (optional)</label>
+              <input id="highlight-patient-instruction" maxlength="500" placeholder="Shown only after clinician confirmation" />
+              <div class="highlight-controls">
+                <label class="compact-field">
+                  <span class="field-label">Priority</span>
+                  <input id="highlight-priority" type="number" min="0" max="100" value="80" />
+                </label>
+                <label class="compact-field">
+                  <span class="field-label">Review status</span>
+                  <select id="highlight-status">
+                    <option value="needs_review">Needs review</option>
+                    <option value="clinician_confirmed">Clinician confirmed</option>
+                    <option value="rejected">Rejected</option>
+                  </select>
+                </label>
+                <label class="compact-field">
+                  <span class="field-label">Assign to</span>
+                  <select id="highlight-assignee">
+                    <option value="">Unassigned</option>
+                    <option value="staff">Staff</option>
+                    <option value="clinician">Clinician</option>
+                  </select>
+                </label>
+              </div>
+              <div class="form-actions">
+                <button id="create-highlight" class="primary-button" type="button" disabled>Create highlight</button>
+              </div>
+              <p id="highlight-create-feedback" class="form-feedback" role="status"></p>
+            </article>
+            <article class="workspace-card audit-card">
+              <div class="workspace-card-heading">
+                <div>
+                  <p class="eyebrow">METADATA ONLY</p>
+                  <h3>Audit trail</h3>
+                </div>
+                <span id="audit-count" class="version-label"></span>
+              </div>
+              <div id="audit-list" class="audit-list" aria-label="Patient audit trail"></div>
             </article>
           </div>
         </section>

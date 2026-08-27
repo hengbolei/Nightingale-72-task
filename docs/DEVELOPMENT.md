@@ -29,6 +29,7 @@ The development dataset uses fixed IDs so tests and demos are reproducible:
 
 - Patient: `20000000-0000-4000-8000-000000000001`
 - Clinic: `10000000-0000-4000-8000-000000000001`
+- Staff: `30000000-0000-4000-8000-000000000001`
 - Clinician: `40000000-0000-4000-8000-000000000001`
 
 ```powershell

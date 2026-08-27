@@ -48,6 +48,9 @@ class InMemoryCareNoteRepository:
             reverse=True,
         )
 
+    def get_entry(self, entry_id: UUID) -> TimelineEntry | None:
+        return self.entries.get(entry_id)
+
     def add_highlight(self, highlight: Highlight) -> Highlight:
         source = self.entries.get(highlight.provenance_pointer.entry_id)
         if source is None or source.patient_id != highlight.patient_id:
@@ -63,6 +66,15 @@ class InMemoryCareNoteRepository:
             key=lambda item: item.priority,
             reverse=True,
         )
+
+    def get_highlight(self, highlight_id: UUID) -> Highlight | None:
+        return self.highlights.get(highlight_id)
+
+    def save_highlight(self, highlight: Highlight) -> Highlight:
+        if highlight.id not in self.highlights:
+            raise LookupError("highlight does not exist")
+        self.highlights[highlight.id] = highlight
+        return highlight
 
     def get_section(self, patient_id: UUID, section: str) -> SectionState | None:
         return self.sections.get((patient_id, section))

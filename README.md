@@ -11,15 +11,26 @@ human-authored notes, source evidence, and access boundaries explicit.
 
 - A 10-second Glance view with prioritized highlights, risk reasons, suggested actions, and
   review states.
+- An actionable highlight workflow with care-role assignment, open/in-progress/completed states,
+  disposition notes, optimistic concurrency checks, and metadata-only audit events.
 - A longitudinal timeline containing patient, staff, clinician, and three distinct AI-scribed
   entry types.
+- Role-authored manual timeline notes whose server-generated author and entry type cannot be
+  forged by the browser.
+- Clinician-created highlights from an exact selected source span, with risk reason, suggested
+  action, priority, assignment, and audit metadata.
 - Exact highlight provenance pointers that resolve to an entry and character span.
+- Exact source-span highlighting in the timeline and clinician/staff/patient demo-role switching.
 - Server-side clinic scope, role ownership, and patient self-access checks.
 - Patient-facing filtering that excludes internal highlights and raw AI-scribed entries.
+- A patient-facing dashboard with explicitly published clinician-confirmed guidance, action
+  progress, and a form for adding patient-authored symptom or question updates.
 - Deterministic section versioning, audit metadata, revert behavior, and optimistic concurrency
   checks.
 - Internal care-team comments with reply links, role mentions, assignment, and resolve/reopen.
 - Editable clinician plan with API-backed revision history and revert controls.
+- An in-page metadata-only audit trail for note creation, comments/replies, resolve/reopen,
+  highlight assignment/completion/review, plan edits, and reverts.
 - A tested PHI redaction gateway for any future external model adapter.
 - Deterministic synthetic data for repeatable demonstrations and tests.
 - Responsive, English-only web interface with loading, empty, forbidden, not-found, and error
@@ -58,12 +69,13 @@ Open:
 
 ## Synthetic demo identity
 
-The frontend uses a fixed clinician identity to load the synthetic patient:
+The frontend can switch among fixed synthetic clinician, staff, and patient identities:
 
 | Entity | ID |
 | --- | --- |
 | Clinic | `10000000-0000-4000-8000-000000000001` |
 | Patient | `20000000-0000-4000-8000-000000000001` |
+| Staff | `30000000-0000-4000-8000-000000000001` |
 | Clinician | `40000000-0000-4000-8000-000000000001` |
 
 The header-based identity mechanism is a development seam only. It must not be treated as
@@ -118,7 +130,7 @@ Implemented in the prototype:
 - Patient response filtering for internal and raw AI content.
 - Full section snapshots and diffs, with a separate metadata-only audit event stream.
 - Deterministic PHI redaction gateway for future LLM adapters.
-- Reproducible Glance benchmark: 1.005 ms warm-path P95 in the recorded local run.
+- Reproducible Glance benchmark: 0.990 ms warm-path P95 in the recorded local run.
 
 Required before production:
 

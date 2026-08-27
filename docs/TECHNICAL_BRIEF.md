@@ -26,6 +26,12 @@ headers make the prototype easy to demonstrate but are not authentication. A pro
 verify signed identities, use PostgreSQL row-level security, encrypt data in transit and at rest,
 and retain auditable metadata under an explicit retention policy.
 
+The patient response uses an explicit publication rule rather than merely hiding internal UI.
+It returns only patient-authored public entries plus a reduced `PatientAction` projection for a
+Highlight that is both clinician-confirmed and supplied with a separate patient-facing
+instruction. The projection omits provenance, internal risk reasoning, assignment and staff
+comments. Draft or AI-suggested patient instructions remain server-side.
+
 No external LLM is connected. A deterministic `PHIRedactionGateway` is present as the mandatory
 boundary for any future model adapter. It removes caller-supplied known names, Singapore identity
 numbers and Singapore/China phone numbers. This is a tested boundary, not a claim of comprehensive
@@ -59,6 +65,9 @@ erDiagram
       text risk_reason
       text suggested_action
       enum status
+      enum action_status
+      enum assigned_to
+      int version
       uuid provenance_entry_id
       int span_start
       int span_end
@@ -90,6 +99,23 @@ Three AI-scribed types are independent timeline entries: doctor consult, nurse c
 session summaries. They retain source labels and review status and never impersonate a clinician.
 A highlight points to an exact entry and character span; the repository rejects missing,
 cross-patient or out-of-bounds sources.
+
+Internal collaborators can assign each highlight and move its action through open, in-progress,
+and completed states. Clinician confirmation and rejection remain limited to clinicians and
+admins. Every update uses an expected version to prevent stale writes and emits a metadata-only
+audit event. The web client renders the exact source span and includes a synthetic role switcher
+for demonstrating server-side patient filtering.
+
+Staff can add a manual Timeline note through a role-derived server operation: the browser supplies
+only title and content, while the service assigns author, clinic and entry type. A clinician can
+select an exact span from an existing manual or AI entry and create a new Highlight. The server
+derives the Highlight text from the stored source rather than trusting client-supplied text, then
+records both note and Highlight creation in the audit stream.
+
+Comment creation, replies, resolve/reopen, patient-authored updates, Highlight review,
+assignment/completion, section edits and reverts all emit metadata-only audit events. Comment
+resolution increments a lightweight comment version so successive lifecycle changes remain
+distinguishable without copying comment text into the audit stream.
 
 Comments support reply relationships, role mentions, assignment, resolve and reopen. Section
 edits store complete snapshots and unified diffs. A separate audit stream contains actor, time,
