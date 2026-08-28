@@ -1,22 +1,21 @@
 from fastapi.testclient import TestClient
 
+from nightingale.core.identity import session_service
 from nightingale.data.seed import (
     DEMO_CLINIC_ID,
     DEMO_CLINICIAN_ID,
     DEMO_PATIENT_ID,
     DEMO_STAFF_ID,
 )
+from nightingale.domain.models import Actor, Role
 from nightingale.main import app
 
 client = TestClient(app)
 
 
 def _headers(actor_id=DEMO_CLINICIAN_ID, role="clinician"):
-    return {
-        "x-actor-id": str(actor_id),
-        "x-actor-role": role,
-        "x-clinic-id": str(DEMO_CLINIC_ID),
-    }
+    token, _ = session_service.issue(Actor(id=actor_id, role=Role(role), clinic_id=DEMO_CLINIC_ID))
+    return {"authorization": f"Bearer {token}"}
 
 
 def test_highlight_assignment_completion_and_audit_round_trip():

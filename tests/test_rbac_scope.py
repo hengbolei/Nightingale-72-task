@@ -2,8 +2,12 @@ from datetime import date
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 
+from nightingale.core.identity import AuthenticationError, session_service
+from nightingale.data.seed import DEMO_CLINIC_ID, DEMO_PATIENT_ID
 from nightingale.domain.models import (
+    Actor,
     EntryOrigin,
     EntryType,
     Patient,
@@ -11,6 +15,7 @@ from nightingale.domain.models import (
     Role,
     TimelineEntry,
 )
+from nightingale.main import app
 from nightingale.services.care_notes import AccessDeniedError
 
 
@@ -31,6 +36,54 @@ def test_staff_cannot_write_clinician_note(service, staff, patient_id, clinic_id
     )
     with pytest.raises(AccessDeniedError):
         service.add_entry(staff, entry)
+
+
+def test_clinician_cannot_write_staff_note(service, clinician, patient_id, clinic_id):
+    entry = TimelineEntry(
+        patient_id=patient_id,
+        clinic_id=clinic_id,
+        author_role=Role.CLINICIAN,
+        author_id=clinician.id,
+        type=EntryType.STAFF_NOTE,
+        title="Forged staff note",
+        content="Synthetic note",
+        origin=EntryOrigin(
+            source=ProvenanceSource.MANUAL_ENTRY,
+            source_id="forged-staff-note",
+            source_label="Synthetic test entry",
+        ),
+    )
+    with pytest.raises(AccessDeniedError):
+        service.add_entry(clinician, entry)
+
+
+def test_system_role_cannot_open_interactive_view(service, patient_id, clinic_id):
+    system = Actor(id=uuid4(), role=Role.SYSTEM, clinic_id=clinic_id)
+    with pytest.raises(AccessDeniedError):
+        service.get_patient_view(system, patient_id)
+
+
+def test_signed_login_rejects_legacy_headers_tampering_and_system_identity():
+    client = TestClient(app)
+    path = f"/api/patients/{DEMO_PATIENT_ID}"
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "clinician", "password": "clinician-demo-2026"},
+    )
+    assert login.status_code == 200
+    token = login.json()["token"]
+    header, body, signature = token.split(".")
+    tampered = f"{header}.{body[:-1]}A.{signature}"
+
+    assert client.get(path, headers={"authorization": f"Bearer {tampered}"}).status_code == 401
+    unauthenticated = TestClient(app)
+    legacy = unauthenticated.get(
+        path,
+        headers={"x-actor-role": "clinician", "x-clinic-id": str(DEMO_CLINIC_ID)},
+    )
+    assert legacy.status_code == 401
+    with pytest.raises(AuthenticationError):
+        session_service.issue(Actor(id=uuid4(), role=Role.SYSTEM, clinic_id=DEMO_CLINIC_ID))
 
 
 def test_cross_clinic_write_is_denied(service, staff, patient_id):

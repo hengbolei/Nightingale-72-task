@@ -1,48 +1,94 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import (
+    APIRouter,
+    Cookie,
+    Depends,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketException,
+    status,
+)
 
-from nightingale.data.seed import seed_demo_data
+from nightingale.core.config import settings
+from nightingale.core.identity import AuthenticationError, session_service
+from nightingale.core.security import clinical_cipher
+from nightingale.data.seed import DEMO_CLINIC_ID, seed_demo_data
 from nightingale.domain.models import (
     Actor,
+    AIIngestRequest,
+    AIIngestResponse,
+    ArchiveApplyRequest,
+    ArchiveApplyResponse,
+    ArchiveBatch,
     AuditEvent,
     Comment,
     CommentCreateRequest,
     CommentResolveRequest,
+    Conflict,
+    ConflictUpdateRequest,
     HealthResponse,
     Highlight,
     HighlightCreateRequest,
+    HighlightImpressionRequest,
     HighlightUpdateRequest,
+    LoginRequest,
     PatientDetailResponse,
-    Role,
+    ResourceRevision,
+    SectionDiff,
     SectionRevertRequest,
     SectionRevision,
     SectionState,
     SectionUpdateRequest,
+    SessionResponse,
+    SourceEvidence,
     TimelineEntry,
     TimelineEntryCreateRequest,
+    TranscriptionResponse,
 )
 from nightingale.repositories.memory import InMemoryCareNoteRepository
+from nightingale.repositories.postgres import PostgresCareNoteRepository
+from nightingale.services.ai import ExternalModelError, ModelNotConfiguredError
 from nightingale.services.care_notes import (
     CareNoteService,
     ConcurrentEditError,
     PatientNotFoundError,
 )
+from nightingale.services.realtime import realtime_hub
 
 router = APIRouter(prefix="/api")
-repository = InMemoryCareNoteRepository()
+repository = (
+    PostgresCareNoteRepository(settings.database_url, DEMO_CLINIC_ID, clinical_cipher)
+    if settings.database_url
+    else InMemoryCareNoteRepository()
+)
 seed_demo_data(repository)
 service = CareNoteService(repository)
 
 
-def current_actor(
-    x_actor_id: Annotated[UUID, Header()],
-    x_actor_role: Annotated[Role, Header()],
-    x_clinic_id: Annotated[UUID, Header()],
-) -> Actor:
-    # Header auth is a development seam. Replace it with verified identity middleware.
-    return Actor(id=x_actor_id, role=x_actor_role, clinic_id=x_clinic_id)
+def session_token(
+    authorization: Annotated[str | None, Header()] = None,
+    nightingale_session: Annotated[str | None, Cookie()] = None,
+) -> str:
+    if authorization is not None:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not value:
+            raise HTTPException(status_code=401, detail="invalid authorization scheme")
+        return value
+    if nightingale_session:
+        return nightingale_session
+    raise HTTPException(status_code=401, detail="authentication required")
+
+
+def current_actor(token: Annotated[str, Depends(session_token)]) -> Actor:
+    try:
+        return session_service.verify(token).actor
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 ActorDependency = Annotated[Actor, Depends(current_actor)]
@@ -65,6 +111,67 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok", service="nightingale-care-note")
 
 
+@router.websocket("/ws/patients/{patient_id}")
+async def patient_realtime(socket: WebSocket, patient_id: UUID) -> None:
+    token = socket.cookies.get("nightingale_session")
+    if not token:
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    try:
+        actor = session_service.verify(token).actor
+        service.get_patient_view(actor, patient_id)
+    except (AuthenticationError, PatientNotFoundError, PermissionError) as exc:
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION) from exc
+    await realtime_hub.connect(patient_id, socket, actor)
+    await realtime_hub.serve(
+        patient_id,
+        socket,
+        lambda: len(repository.list_audit_events(patient_id, actor.clinic_id)),
+    )
+
+
+@router.post("/auth/login", response_model=SessionResponse)
+def login(payload: LoginRequest, response: Response) -> SessionResponse:
+    try:
+        token, session = session_service.authenticate(payload.username, payload.password)
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    response.set_cookie(
+        "nightingale_session",
+        token,
+        max_age=settings.token_ttl_seconds,
+        httponly=True,
+        secure=settings.secure_cookies,
+        samesite="strict",
+        path="/",
+    )
+    return SessionResponse(
+        actor=session.actor,
+        expires_at=session.expires_at,
+        token=token,
+    )
+
+
+@router.get("/auth/me", response_model=SessionResponse)
+def session_details(
+    token: Annotated[str, Depends(session_token)],
+    actor: ActorDependency,
+) -> SessionResponse:
+    session = session_service.verify(token)
+    return SessionResponse(actor=actor, expires_at=session.expires_at)
+
+
+@router.post("/auth/logout", status_code=204)
+def logout(
+    response: Response,
+    token: Annotated[str, Depends(session_token)],
+) -> None:
+    try:
+        session_service.revoke(token)
+    except AuthenticationError:
+        pass
+    response.delete_cookie("nightingale_session", path="/")
+
+
 @router.get("/patients/{patient_id}", response_model=PatientDetailResponse)
 def patient_view(
     patient_id: UUID,
@@ -73,6 +180,30 @@ def patient_view(
     try:
         return service.get_patient_view(actor, patient_id)
     except (PatientNotFoundError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.get(
+    "/patients/{patient_id}/entries/{entry_id}/source",
+    response_model=SourceEvidence,
+)
+def entry_source(patient_id: UUID, entry_id: UUID, actor: ActorDependency) -> SourceEvidence:
+    try:
+        return service.get_source_evidence(actor, patient_id, entry_id)
+    except (PatientNotFoundError, LookupError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.get(
+    "/patients/{patient_id}/highlights/{highlight_id}/source",
+    response_model=SourceEvidence,
+)
+def highlight_source(
+    patient_id: UUID, highlight_id: UUID, actor: ActorDependency
+) -> SourceEvidence:
+    try:
+        return service.get_highlight_source_evidence(actor, patient_id, highlight_id)
+    except (PatientNotFoundError, LookupError, PermissionError) as exc:
         raise translate_service_error(exc) from exc
 
 
@@ -87,8 +218,9 @@ def create_comment(
             payload.content,
             payload.assigned_to,
             payload.parent_id,
+            payload.target,
         )
-    except (PatientNotFoundError, PermissionError, LookupError) as exc:
+    except (PatientNotFoundError, PermissionError, LookupError, ValueError) as exc:
         raise translate_service_error(exc) from exc
 
 
@@ -116,6 +248,79 @@ def create_highlight(
         raise translate_service_error(exc) from exc
 
 
+@router.post(
+    "/patients/{patient_id}/highlights/{highlight_id}/impressions",
+    status_code=204,
+)
+def record_highlight_impression(
+    patient_id: UUID,
+    highlight_id: UUID,
+    payload: HighlightImpressionRequest,
+    actor: ActorDependency,
+) -> None:
+    try:
+        service.record_highlight_impression(
+            actor, patient_id, highlight_id, payload.expected_version
+        )
+    except (
+        PatientNotFoundError,
+        LookupError,
+        PermissionError,
+        ConcurrentEditError,
+    ) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.post(
+    "/patients/{patient_id}/ai-ingest",
+    response_model=AIIngestResponse,
+    status_code=201,
+)
+def ai_ingest(
+    patient_id: UUID, payload: AIIngestRequest, actor: ActorDependency
+) -> AIIngestResponse:
+    try:
+        return service.ingest_ai_summary(actor, patient_id, payload)
+    except ModelNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ExternalModelError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (PatientNotFoundError, PermissionError, ValueError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.post(
+    "/patients/{patient_id}/transcriptions",
+    response_model=TranscriptionResponse,
+)
+async def transcribe_audio(
+    patient_id: UUID, request: Request, actor: ActorDependency
+) -> TranscriptionResponse:
+    try:
+        service._require_internal_collaborator(actor)
+        if repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        content_type = request.headers.get("content-type", "audio/webm")
+        if content_type.split(";", 1)[0] not in {
+            "audio/webm",
+            "audio/wav",
+            "audio/mpeg",
+            "audio/mp4",
+            "audio/ogg",
+        }:
+            raise ValueError("unsupported audio content type")
+        audio = await request.body()
+        if not audio or len(audio) > 25 * 1024 * 1024:
+            raise ValueError("audio must contain 1 byte to 25 MiB")
+        return service.ai_gateway.transcribe(audio, content_type)
+    except ModelNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ExternalModelError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except (PatientNotFoundError, PermissionError, ValueError) as exc:
+        raise translate_service_error(exc) from exc
+
+
 @router.patch("/patients/{patient_id}/comments/{comment_id}", response_model=Comment)
 def resolve_comment(
     patient_id: UUID,
@@ -124,8 +329,14 @@ def resolve_comment(
     actor: ActorDependency,
 ) -> Comment:
     try:
-        return service.set_comment_resolved(actor, patient_id, comment_id, payload.resolved)
-    except (LookupError, PermissionError) as exc:
+        return service.set_comment_resolved(
+            actor,
+            patient_id,
+            comment_id,
+            payload.resolved,
+            payload.expected_version,
+        )
+    except (LookupError, PermissionError, ConcurrentEditError) as exc:
         raise translate_service_error(exc) from exc
 
 
@@ -144,6 +355,35 @@ def update_highlight(
         PermissionError,
         ConcurrentEditError,
     ) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.patch(
+    "/patients/{patient_id}/conflicts/{conflict_id}",
+    response_model=Conflict,
+)
+def update_conflict(
+    patient_id: UUID,
+    conflict_id: UUID,
+    payload: ConflictUpdateRequest,
+    actor: ActorDependency,
+) -> Conflict:
+    try:
+        return service.update_conflict(actor, patient_id, conflict_id, payload)
+    except (LookupError, PermissionError, ConcurrentEditError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.get(
+    "/patients/{patient_id}/conflicts/{conflict_id}/revisions",
+    response_model=list[ResourceRevision],
+)
+def conflict_revisions(
+    patient_id: UUID, conflict_id: UUID, actor: ActorDependency
+) -> list[ResourceRevision]:
+    try:
+        return service.list_resource_revisions(actor, patient_id, "conflict", conflict_id)
+    except (PatientNotFoundError, LookupError, PermissionError) as exc:
         raise translate_service_error(exc) from exc
 
 
@@ -176,6 +416,51 @@ def section_revisions(
         raise translate_service_error(exc) from exc
 
 
+@router.get(
+    "/patients/{patient_id}/sections/{section}/compare",
+    response_model=SectionDiff,
+)
+def compare_section_revisions(
+    patient_id: UUID,
+    section: str,
+    from_version: int,
+    to_version: int,
+    actor: ActorDependency,
+) -> SectionDiff:
+    try:
+        return service.compare_section_versions(
+            actor, patient_id, section, from_version, to_version
+        )
+    except (LookupError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.get(
+    "/patients/{patient_id}/highlights/{highlight_id}/revisions",
+    response_model=list[ResourceRevision],
+)
+def highlight_revisions(
+    patient_id: UUID, highlight_id: UUID, actor: ActorDependency
+) -> list[ResourceRevision]:
+    try:
+        return service.list_resource_revisions(actor, patient_id, "highlight", highlight_id)
+    except (PatientNotFoundError, LookupError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.get(
+    "/patients/{patient_id}/comments/{comment_id}/revisions",
+    response_model=list[ResourceRevision],
+)
+def comment_revisions(
+    patient_id: UUID, comment_id: UUID, actor: ActorDependency
+) -> list[ResourceRevision]:
+    try:
+        return service.list_resource_revisions(actor, patient_id, "comment", comment_id)
+    except (PatientNotFoundError, LookupError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
 @router.post("/patients/{patient_id}/sections/{section}/revert", response_model=SectionState)
 def revert_section(
     patient_id: UUID,
@@ -196,3 +481,35 @@ def patient_audit(patient_id: UUID, actor: ActorDependency) -> list[AuditEvent]:
         return service.list_audit_events(actor, patient_id)
     except (PatientNotFoundError, PermissionError) as exc:
         raise translate_service_error(exc) from exc
+
+
+@router.get("/patients/{patient_id}/archive-preview", response_model=ArchiveBatch)
+def archive_preview(patient_id: UUID, actor: ActorDependency) -> ArchiveBatch:
+    try:
+        return service.archive_preview(actor, patient_id)
+    except (PatientNotFoundError, PermissionError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.post("/patients/{patient_id}/archive", response_model=ArchiveApplyResponse)
+def apply_archive(
+    patient_id: UUID, payload: ArchiveApplyRequest, actor: ActorDependency
+) -> ArchiveApplyResponse:
+    try:
+        return ArchiveApplyResponse(
+            archived=service.apply_archive(actor, patient_id, payload.entry_ids)
+        )
+    except (PatientNotFoundError, PermissionError, ValueError) as exc:
+        raise translate_service_error(exc) from exc
+
+
+@router.post("/maintenance/audit-retention")
+def enforce_audit_retention(actor: ActorDependency) -> dict[str, int | bool]:
+    if actor.role.value != "admin":
+        raise HTTPException(status_code=403, detail="only admins can enforce retention")
+    deleted = repository.purge_expired_audit_events(settings.audit_retention_days)
+    return {
+        "deleted": deleted,
+        "retention_days": settings.audit_retention_days,
+        "chain_valid": repository.verify_audit_chain(),
+    }

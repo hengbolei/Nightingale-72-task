@@ -31,3 +31,4 @@ def test_seed_is_idempotent():
     assert len(repository.patients) == 1
     assert len(repository.entries) == 6
     assert len(repository.highlights) == 3
+    assert len(repository.source_artifacts) == 6

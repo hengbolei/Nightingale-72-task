@@ -1,17 +1,17 @@
 from fastapi.testclient import TestClient
 
+from nightingale.core.identity import session_service
 from nightingale.data.seed import DEMO_CLINIC_ID, DEMO_CLINICIAN_ID, DEMO_PATIENT_ID
+from nightingale.domain.models import Actor, Role
 from nightingale.main import app
 
 client = TestClient(app)
 
 
 def _headers(role="clinician"):
-    return {
-        "x-actor-id": str(DEMO_CLINICIAN_ID),
-        "x-actor-role": role,
-        "x-clinic-id": str(DEMO_CLINIC_ID),
-    }
+    actor = Actor(id=DEMO_CLINICIAN_ID, role=Role(role), clinic_id=DEMO_CLINIC_ID)
+    token, _ = session_service.issue(actor)
+    return {"authorization": f"Bearer {token}"}
 
 
 def test_comment_mention_assignment_and_resolution_round_trip():
@@ -24,6 +24,12 @@ def test_comment_mention_assignment_and_resolution_round_trip():
     comment = created.json()
     assert comment["mentions"] == ["staff"]
     assert comment["assigned_to"] == "staff"
+    assert comment["target"] == {
+        "resource_type": "section",
+        "resource_id": "plan",
+        "start": None,
+        "end": None,
+    }
 
     reply = client.post(
         f"/api/patients/{DEMO_PATIENT_ID}/comments",
@@ -36,7 +42,7 @@ def test_comment_mention_assignment_and_resolution_round_trip():
     resolved = client.patch(
         f"/api/patients/{DEMO_PATIENT_ID}/comments/{comment['id']}",
         headers=_headers(),
-        json={"resolved": True},
+        json={"resolved": True, "expected_version": comment["version"]},
     )
     assert resolved.status_code == 200
     assert resolved.json()["resolved"] is True
@@ -44,10 +50,21 @@ def test_comment_mention_assignment_and_resolution_round_trip():
     reopened = client.patch(
         f"/api/patients/{DEMO_PATIENT_ID}/comments/{comment['id']}",
         headers=_headers(),
-        json={"resolved": False},
+        json={
+            "resolved": False,
+            "expected_version": resolved.json()["version"],
+        },
     )
     assert reopened.status_code == 200
     assert reopened.json()["resolved"] is False
+
+    revisions = client.get(
+        f"/api/patients/{DEMO_PATIENT_ID}/comments/{comment['id']}/revisions",
+        headers=_headers(),
+    )
+    assert revisions.status_code == 200
+    assert [item["version"] for item in revisions.json()] == [1, 2, 3]
+    assert revisions.json()[-1]["snapshot"]["resolved"] is False
 
     audit = client.get(f"/api/patients/{DEMO_PATIENT_ID}/audit", headers=_headers())
     assert [event["operation"] for event in audit.json()[-4:]] == [
@@ -90,13 +107,12 @@ def test_section_edit_history_and_revert_round_trip():
 
 
 def test_patient_cannot_use_internal_collaboration_api():
+    token, _ = session_service.issue(
+        Actor(id=DEMO_PATIENT_ID, role=Role.PATIENT, clinic_id=DEMO_CLINIC_ID)
+    )
     response = client.post(
         f"/api/patients/{DEMO_PATIENT_ID}/comments",
-        headers={
-            "x-actor-id": str(DEMO_PATIENT_ID),
-            "x-actor-role": "patient",
-            "x-clinic-id": str(DEMO_CLINIC_ID),
-        },
+        headers={"authorization": f"Bearer {token}"},
         json={"content": "Should be rejected"},
     )
     assert response.status_code == 403

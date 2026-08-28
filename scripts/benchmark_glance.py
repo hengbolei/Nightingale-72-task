@@ -5,7 +5,9 @@ from time import perf_counter
 
 from fastapi.testclient import TestClient
 
+from nightingale.core.identity import session_service
 from nightingale.data.seed import DEMO_CLINIC_ID, DEMO_CLINICIAN_ID, DEMO_PATIENT_ID
+from nightingale.domain.models import Actor, Role
 from nightingale.main import app
 
 
@@ -16,11 +18,14 @@ def percentile(values: list[float], percentile_value: float) -> float:
 
 
 def run_benchmark(iterations: int, warmup: int) -> dict[str, float | int | str]:
-    headers = {
-        "x-actor-id": str(DEMO_CLINICIAN_ID),
-        "x-actor-role": "clinician",
-        "x-clinic-id": str(DEMO_CLINIC_ID),
-    }
+    token, _ = session_service.issue(
+        Actor(
+            id=DEMO_CLINICIAN_ID,
+            role=Role.CLINICIAN,
+            clinic_id=DEMO_CLINIC_ID,
+        )
+    )
+    headers = {"authorization": f"Bearer {token}"}
     path = f"/api/patients/{DEMO_PATIENT_ID}"
     timings: list[float] = []
     with TestClient(app) as client:

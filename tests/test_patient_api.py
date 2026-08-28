@@ -2,22 +2,21 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from nightingale.core.identity import session_service
 from nightingale.data.seed import (
     DEMO_CLINIC_ID,
     DEMO_CLINICIAN_ID,
     DEMO_PATIENT_ID,
 )
+from nightingale.domain.models import Actor, Role
 from nightingale.main import app
 
 client = TestClient(app)
 
 
 def _headers(actor_id, role, clinic_id=DEMO_CLINIC_ID):
-    return {
-        "x-actor-id": str(actor_id),
-        "x-actor-role": role,
-        "x-clinic-id": str(clinic_id),
-    }
+    token, _ = session_service.issue(Actor(id=actor_id, role=Role(role), clinic_id=clinic_id))
+    return {"authorization": f"Bearer {token}"}
 
 
 def test_clinician_can_get_seeded_patient_detail():
@@ -50,6 +49,14 @@ def test_patient_response_does_not_expose_internal_ai_content():
         "updated_at",
     }
     assert "lisinopril" in body["patient_actions"][0]["instruction"]
+
+
+def test_patient_cannot_open_original_internal_source_artifact():
+    response = client.get(
+        (f"/api/patients/{DEMO_PATIENT_ID}/entries/50000000-0000-4000-8000-000000000006/source"),
+        headers=_headers(DEMO_PATIENT_ID, "patient"),
+    )
+    assert response.status_code == 403
 
 
 def test_cross_clinic_patient_is_not_discoverable():

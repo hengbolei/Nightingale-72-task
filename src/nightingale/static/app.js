@@ -3,14 +3,26 @@ import {
   DEMO_CONTEXT,
   addComment,
   addTimelineEntry,
+  compareSectionRevisions,
   createHighlight,
   getAuditEvents,
+  getEntrySource,
+  getCommentRevisions,
+  getHighlightRevisions,
+  getHighlightSource,
+  getConflictRevisions,
   getPatientDetail,
   getSectionRevisions,
+  getSession,
+  ingestAI,
+  login,
+  logout,
+  recordHighlightImpression,
   revertSection,
-  setDemoRole,
   setCommentResolved,
+  transcribeAudio,
   updateHighlight,
+  updateConflict,
   updateSection,
 } from "/static/api.js";
 
@@ -22,6 +34,9 @@ const elements = {
   content: document.querySelector("#patient-content"),
   highlightList: document.querySelector("#highlight-list"),
   highlightCount: document.querySelector("#highlight-count"),
+  conflictPanel: document.querySelector("#conflict-panel"),
+  conflictList: document.querySelector("#conflict-list"),
+  conflictCount: document.querySelector("#conflict-count"),
   timelineList: document.querySelector("#timeline-list"),
   entryCount: document.querySelector("#entry-count"),
   patientHeader: document.querySelector("#patient-header"),
@@ -35,8 +50,14 @@ const elements = {
   showHistory: document.querySelector("#show-history"),
   sectionFeedback: document.querySelector("#section-feedback"),
   revisionList: document.querySelector("#revision-list"),
+  compareFrom: document.querySelector("#compare-from"),
+  compareTo: document.querySelector("#compare-to"),
+  compareVersions: document.querySelector("#compare-versions"),
+  versionCompareOutput: document.querySelector("#version-compare-output"),
   commentContent: document.querySelector("#comment-content"),
   commentAssignee: document.querySelector("#comment-assignee"),
+  commentTarget: document.querySelector("#comment-target"),
+  commentOnPlanSelection: document.querySelector("#comment-on-plan-selection"),
   addComment: document.querySelector("#add-comment"),
   commentFeedback: document.querySelector("#comment-feedback"),
   commentList: document.querySelector("#comment-list"),
@@ -51,7 +72,8 @@ const elements = {
   highlightReason: document.querySelector("#highlight-reason"),
   highlightAction: document.querySelector("#highlight-action"),
   highlightPatientInstruction: document.querySelector("#highlight-patient-instruction"),
-  highlightPriority: document.querySelector("#highlight-priority"),
+  highlightRiskLevel: document.querySelector("#highlight-risk-level"),
+  highlightEntities: document.querySelector("#highlight-entities"),
   highlightStatus: document.querySelector("#highlight-status"),
   highlightAssignee: document.querySelector("#highlight-assignee"),
   createHighlight: document.querySelector("#create-highlight"),
@@ -65,14 +87,33 @@ const elements = {
   patientEntryContent: document.querySelector("#patient-entry-content"),
   addPatientEntry: document.querySelector("#add-patient-entry"),
   patientEntryFeedback: document.querySelector("#patient-entry-feedback"),
-  demoRole: document.querySelector("#demo-role"),
+  loginPanel: document.querySelector("#login-panel"),
+  loginUsername: document.querySelector("#login-username"),
+  loginPassword: document.querySelector("#login-password"),
+  loginButton: document.querySelector("#login-button"),
+  loginFeedback: document.querySelector("#login-feedback"),
+  currentRole: document.querySelector("#current-role"),
+  logoutButton: document.querySelector("#logout-button"),
   glancePanel: document.querySelector("#glance-panel"),
   workspacePanel: document.querySelector("#workspace-panel"),
+  presenceStatus: document.querySelector("#presence-status"),
+  aiIngestCard: document.querySelector("#ai-ingest-card"),
+  aiTitle: document.querySelector("#ai-title"),
+  aiSource: document.querySelector("#ai-source"),
+  aiRawText: document.querySelector("#ai-raw-text"),
+  aiIngest: document.querySelector("#ai-ingest"),
+  recordAudio: document.querySelector("#record-audio"),
+  aiFeedback: document.querySelector("#ai-feedback"),
 };
 
 let currentPlanVersion = 0;
 let replyToCommentId = null;
 let selectedHighlightSource = null;
+let selectedCommentSpanTarget = null;
+let realtimeSocket = null;
+let mediaRecorder = null;
+let audioChunks = [];
+const recordedImpressions = new Set();
 
 const screenStates = {
   loading: ["Loading longitudinal record", "Securely retrieving patient details, priorities, and timeline."],
@@ -138,12 +179,36 @@ function setScreenState(state) {
   elements.patientHeader.setAttribute("aria-busy", String(state === "loading"));
 }
 
+function showAuthenticatedSession(session) {
+  DEMO_CONTEXT.actorRole = session.actor.role;
+  elements.loginPanel.hidden = true;
+  elements.patientHeader.hidden = false;
+  elements.currentRole.textContent = roleLabels[session.actor.role] || session.actor.role;
+  elements.logoutButton.hidden = false;
+  connectRealtime();
+}
+
+function showLogin() {
+  DEMO_CONTEXT.actorRole = null;
+  elements.loginPanel.hidden = false;
+  elements.patientHeader.hidden = true;
+  elements.screenState.hidden = true;
+  elements.content.hidden = true;
+  elements.currentRole.textContent = "Signed out";
+  elements.logoutButton.hidden = true;
+  elements.presenceStatus.hidden = true;
+  realtimeSocket?.close();
+  realtimeSocket = null;
+  elements.loginPassword.value = "";
+}
+
 function clearPatient() {
   elements.name.textContent = "Patient record";
   elements.pronouns.textContent = "—";
   elements.mrn.textContent = "—";
   elements.dob.textContent = "—";
   elements.highlightList.replaceChildren();
+  elements.conflictList.replaceChildren();
   elements.timelineList.replaceChildren();
 }
 
@@ -200,10 +265,108 @@ function renderPatientActions(actions) {
   });
 }
 
+function focusTimelineEntries(entryIds) {
+  const target = entryIds
+    .map((entryId) => document.querySelector(`#entry-${entryId}`))
+    .find(Boolean);
+  if (!target) return;
+  document.querySelectorAll(".source-target").forEach((node) => {
+    node.classList.remove("source-target");
+  });
+  entryIds.forEach((entryId) => {
+    document.querySelector(`#entry-${entryId}`)?.classList.add("source-target");
+  });
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function renderConflicts(conflicts) {
+  elements.conflictList.replaceChildren();
+  elements.conflictPanel.hidden = conflicts.length === 0;
+  elements.conflictCount.textContent = `${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"}`;
+  conflicts.forEach((conflict) => {
+    const card = createElement("article", `conflict-card ${conflict.status}`);
+    const top = createElement("div", "conflict-card-top");
+    const conflictStatusLabels = {
+      needs_review: "Needs review",
+      clinician_precedence: "Clinician precedence",
+      clinician_confirmed: "Clinician confirmed",
+      resolved: "Resolved",
+    };
+    top.append(
+      createElement("span", "conflict-category", conflict.category),
+      createElement(
+        "span",
+        `status-chip ${conflict.status}`,
+        conflictStatusLabels[conflict.status] || conflict.status,
+      ),
+    );
+    const source = createElement("button", "text-button", "Compare source entries");
+    source.type = "button";
+    source.addEventListener("click", () => focusTimelineEntries(conflict.entry_ids));
+    card.append(
+      top,
+      createElement("h4", "conflict-summary", conflict.summary),
+      createElement("p", "conflict-rationale", conflict.rationale),
+      source,
+    );
+    if (conflict.resolution_note) {
+      card.append(createElement("p", "conflict-resolution", conflict.resolution_note));
+    }
+    const history = createElement("button", "text-button", "History");
+    history.type = "button";
+    history.addEventListener("click", async () => {
+      try {
+        showResourceHistory(card, await getConflictRevisions(conflict.id));
+      } catch (error) {
+        showFeedback(elements.sectionFeedback, error.message, true);
+      }
+    });
+    card.append(history);
+    if (["clinician", "admin"].includes(DEMO_CONTEXT.actorRole)) {
+      const status = createSelect(
+        "Adjudication",
+        {
+          clinician_confirmed: "Clinician confirmed",
+          resolved: "Resolved",
+          needs_review: "Reopen for review",
+        },
+        conflict.status,
+        `conflict-status-${conflict.id}`,
+      );
+      const note = createElement("textarea", "conflict-note");
+      note.rows = 2;
+      note.placeholder = "Resolution or verification note";
+      note.value = conflict.resolution_note || "";
+      const save = createElement("button", "primary-button", "Save adjudication");
+      save.type = "button";
+      save.addEventListener("click", async () => {
+        try {
+          await updateConflict(conflict.id, {
+            expected_version: conflict.version,
+            status: status.select.value,
+            resolution_note: note.value.trim() || null,
+          });
+          await loadPatient();
+        } catch (error) {
+          showFeedback(elements.sectionFeedback, error.message, true);
+        }
+      });
+      card.append(status.wrapper, note, save);
+    }
+    elements.conflictList.append(card);
+  });
+}
+
 function renderHighlights(highlights) {
   elements.highlightList.replaceChildren();
   elements.highlightCount.textContent = `${highlights.length} priority item${highlights.length === 1 ? "" : "s"}`;
   highlights.forEach((highlight, index) => {
+    if (!recordedImpressions.has(highlight.id)) {
+      recordedImpressions.add(highlight.id);
+      recordHighlightImpression(highlight.id, highlight.version).catch(() => {
+        recordedImpressions.delete(highlight.id);
+      });
+    }
     const card = createElement(
       "article",
       `highlight-card priority-${index + 1} action-${highlight.action_status}`,
@@ -224,6 +387,23 @@ function renderHighlights(highlights) {
       createElement("h3", "highlight-text", highlight.text),
       createElement("p", "risk-reason", highlight.risk_reason),
     );
+    const explanation = createElement("details", "priority-explanation");
+    const explanationSummary = createElement(
+      "summary",
+      "",
+      `Why this priority is ${highlight.priority}`,
+    );
+    const factorList = createElement("ul", "priority-factor-list");
+    highlight.priority_factors.forEach((factor) => {
+      const item = createElement("li", "priority-factor");
+      item.append(
+        createElement("strong", "", `${factor.points >= 0 ? "+" : ""}${factor.points} ${factor.label}`),
+        createElement("span", "", factor.explanation),
+      );
+      factorList.append(item);
+    });
+    explanation.append(explanationSummary, factorList);
+    body.append(explanation);
     const footer = createElement("div", "highlight-footer");
     const action = createElement("p", "suggested-action");
     action.append(
@@ -243,7 +423,35 @@ function renderHighlights(highlights) {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
     };
     sourceButton.addEventListener("click", openSource);
-    footer.append(action, sourceButton);
+    const claimButton = createElement("button", "text-button", "View original claim");
+    claimButton.type = "button";
+    claimButton.disabled = !highlight.source_evidence_pointer;
+    claimButton.addEventListener("click", async () => {
+      try {
+        const evidence = await getHighlightSource(highlight.id);
+        let evidenceBox = body.querySelector(".source-evidence");
+        if (!evidenceBox) {
+          evidenceBox = createElement("div", "source-evidence");
+          body.append(evidenceBox);
+        }
+        evidenceBox.replaceChildren(
+          createElement("strong", "", evidence.artifact.label),
+          createElement("blockquote", "", evidence.excerpt),
+        );
+      } catch (error) {
+        showFeedback(feedback, error.message, true);
+      }
+    });
+    const historyButton = createElement("button", "text-button", "Version history");
+    historyButton.type = "button";
+    historyButton.addEventListener("click", async () => {
+      try {
+        showResourceHistory(body, await getHighlightRevisions(highlight.id));
+      } catch (error) {
+        showFeedback(feedback, error.message, true);
+      }
+    });
+    footer.append(action, sourceButton, claimButton, historyButton);
 
     const controls = createElement("div", "highlight-controls");
     const reviewSelect = createSelect(
@@ -374,6 +582,31 @@ function useSelectedTimelineText(entry, content) {
   elements.highlightComposerCard.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
+function useSelectedCommentText(entry, content) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    showFeedback(elements.commentFeedback, "Select a phrase in this entry first.", true);
+    return;
+  }
+  const range = selection.getRangeAt(0);
+  if (!content.contains(range.startContainer) || !content.contains(range.endContainer)) {
+    showFeedback(elements.commentFeedback, "The selection must stay within one entry.", true);
+    return;
+  }
+  const before = document.createRange();
+  before.selectNodeContents(content);
+  before.setEnd(range.startContainer, range.startOffset);
+  const start = before.toString().length;
+  selectedCommentSpanTarget = {
+    resource_type: "entry",
+    resource_id: entry.id,
+    start,
+    end: start + range.toString().length,
+  };
+  elements.commentContent.focus();
+  showFeedback(elements.commentFeedback, `Comment will attach to “${range.toString()}”.`);
+}
+
 function renderTimeline(entries, highlights) {
   elements.timelineList.replaceChildren();
   elements.entryCount.textContent = `${entries.length} timeline entr${entries.length === 1 ? "y" : "ies"}`;
@@ -409,6 +642,32 @@ function renderTimeline(entries, highlights) {
     footer.append(
       createElement("span", "origin-label", `Source: ${entry.origin.source_label}`),
     );
+    if (entry.origin.source_pointer && DEMO_CONTEXT.actorRole !== "patient") {
+      const evidenceButton = createElement("button", "text-button", "View original evidence");
+      evidenceButton.type = "button";
+      evidenceButton.addEventListener("click", async () => {
+        evidenceButton.disabled = true;
+        try {
+          const evidence = await getEntrySource(entry.id);
+          let evidenceBox = card.querySelector(".source-evidence");
+          if (!evidenceBox) {
+            evidenceBox = createElement("div", "source-evidence");
+            card.append(evidenceBox);
+          }
+          evidenceBox.replaceChildren(
+            createElement("strong", "", evidence.artifact.label),
+            createElement("blockquote", "", evidence.excerpt),
+            createElement("pre", "", evidence.artifact.content),
+          );
+          evidenceBox.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } catch (error) {
+          showFeedback(elements.commentFeedback, error.message, true);
+        } finally {
+          evidenceButton.disabled = false;
+        }
+      });
+      footer.append(evidenceButton);
+    }
     if (entry.review_status) {
       footer.append(
         createElement(
@@ -429,10 +688,44 @@ function renderTimeline(entries, highlights) {
       selectButton.addEventListener("click", () => useSelectedTimelineText(entry, content));
       footer.append(selectButton);
     }
+    if (DEMO_CONTEXT.actorRole !== "patient") {
+      const commentButton = createElement(
+        "button",
+        "text-button entry-selection-action",
+        "Comment on selected text",
+      );
+      commentButton.type = "button";
+      commentButton.addEventListener("mousedown", (event) => event.preventDefault());
+      commentButton.addEventListener("click", () => useSelectedCommentText(entry, content));
+      footer.append(commentButton);
+    }
     card.append(footer);
     item.append(rail, card);
     elements.timelineList.append(item);
   });
+}
+
+function renderCommentTargets(entries, sections) {
+  elements.commentTarget.replaceChildren();
+  sections.forEach((section) => {
+    const option = createElement("option", "", `Section: ${section.section}`);
+    option.value = `section:${section.section}`;
+    elements.commentTarget.append(option);
+  });
+  entries.forEach((entry) => {
+    const option = createElement("option", "", `Entry: ${entry.title}`);
+    option.value = `entry:${entry.id}`;
+    elements.commentTarget.append(option);
+  });
+}
+
+function selectedCommentTarget() {
+  if (selectedCommentSpanTarget) return selectedCommentSpanTarget;
+  const [resourceType, ...resourceIdParts] = elements.commentTarget.value.split(":");
+  return {
+    resource_type: resourceType,
+    resource_id: resourceIdParts.join(":"),
+  };
 }
 
 function renderAudit(events) {
@@ -490,7 +783,7 @@ function renderComments(comments) {
     toggle.type = "button";
     toggle.addEventListener("click", async () => {
       try {
-        await setCommentResolved(comment.id, !comment.resolved);
+        await setCommentResolved(comment.id, !comment.resolved, comment.version);
         await loadPatient();
       } catch (error) {
         showFeedback(elements.commentFeedback, error.message, true);
@@ -503,10 +796,32 @@ function renderComments(comments) {
       elements.commentContent.focus();
       showFeedback(elements.commentFeedback, "Your next comment will be added as a reply.");
     });
+    const history = createElement("button", "text-button", "History");
+    history.type = "button";
+    history.addEventListener("click", async () => {
+      try {
+        showResourceHistory(item, await getCommentRevisions(comment.id));
+      } catch (error) {
+        showFeedback(elements.commentFeedback, error.message, true);
+      }
+    });
     const controls = createElement("span", "comment-controls");
-    controls.append(reply, toggle);
+    controls.append(reply, toggle, history);
     meta.append(controls);
     item.append(meta, createElement("p", "comment-content", comment.content));
+    const targetLabel = comment.target.resource_type === "entry"
+      ? `Attached to timeline entry ${comment.target.resource_id}`
+      : `Attached to section ${comment.target.resource_id}`;
+    item.append(createElement("span", "comment-target", targetLabel));
+    if (comment.target.start !== null && comment.target.start !== undefined) {
+      item.append(
+        createElement(
+          "span",
+          "comment-target",
+          ` · exact span ${comment.target.start}–${comment.target.end}`,
+        ),
+      );
+    }
     comment.mentions.forEach((mention) => {
       item.append(createElement("span", "mention-chip", `@${mention}`));
     });
@@ -524,10 +839,109 @@ function showFeedback(element, message, isError = false) {
   element.classList.toggle("error", isError);
 }
 
+function connectRealtime() {
+  realtimeSocket?.close();
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  realtimeSocket = new WebSocket(
+    `${protocol}//${location.host}/api/ws/patients/${DEMO_CONTEXT.patientId}`,
+  );
+  let refreshTimer = null;
+  realtimeSocket.addEventListener("message", (event) => {
+    const message = JSON.parse(event.data);
+    if (message.type === "presence") {
+      elements.presenceStatus.hidden = false;
+      elements.presenceStatus.textContent = `${message.count} online`;
+    }
+    if (message.type === "refresh" && !refreshTimer) {
+      refreshTimer = window.setTimeout(async () => {
+        refreshTimer = null;
+        await loadPatient();
+      }, 250);
+    }
+  });
+  realtimeSocket.addEventListener("close", () => {
+    elements.presenceStatus.hidden = true;
+  });
+}
+
+function showResourceHistory(container, revisions) {
+  let history = container.querySelector(".resource-history");
+  if (!history) {
+    history = createElement("div", "resource-history");
+    container.append(history);
+  }
+  history.replaceChildren();
+  if (revisions.length > 1) {
+    const compare = createElement("div", "version-compare-controls");
+    const from = createElement("select");
+    const to = createElement("select");
+    revisions.forEach((revision) => {
+      const first = createElement("option", "", `Version ${revision.version}`);
+      first.value = String(revision.version);
+      from.append(first);
+      to.append(first.cloneNode(true));
+    });
+    from.value = String(revisions[0].version);
+    to.value = String(revisions.at(-1).version);
+    const run = createElement("button", "secondary-button", "Compare A/B");
+    const output = createElement("pre", "resource-snapshot");
+    output.hidden = true;
+    run.type = "button";
+    run.addEventListener("click", () => {
+      const before = revisions.find((item) => item.version === Number(from.value))?.snapshot || {};
+      const after = revisions.find((item) => item.version === Number(to.value))?.snapshot || {};
+      const changes = {};
+      new Set([...Object.keys(before), ...Object.keys(after)]).forEach((key) => {
+        if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) {
+          changes[key] = { A: before[key], B: after[key] };
+        }
+      });
+      output.hidden = false;
+      output.textContent = JSON.stringify(changes, null, 2) || "No differences.";
+    });
+    compare.append(from, to, run);
+    history.append(compare, output);
+  }
+  revisions.forEach((revision, index) => {
+    const previous = revisions[index - 1]?.snapshot || {};
+    const changedFields = Object.keys(revision.snapshot).filter(
+      (key) => JSON.stringify(previous[key]) !== JSON.stringify(revision.snapshot[key]),
+    );
+    const item = createElement("details", "resource-history-item");
+    item.append(
+      createElement(
+        "summary",
+        "",
+        `v${revision.version} · ${revision.operation} · ${formatDateTime(revision.changed_at)}`,
+      ),
+      createElement(
+        "p",
+        "resource-change-list",
+        `Changed fields: ${changedFields.join(", ") || "none"}`,
+      ),
+      createElement("pre", "resource-snapshot", JSON.stringify(revision.snapshot, null, 2)),
+    );
+    history.append(item);
+  });
+}
+
 async function renderHistory() {
   try {
     const revisions = await getSectionRevisions("plan");
     elements.revisionList.replaceChildren();
+    elements.compareFrom.replaceChildren();
+    elements.compareTo.replaceChildren();
+    revisions.forEach((revision) => {
+      const fromOption = createElement("option", "", `Version ${revision.version}`);
+      fromOption.value = revision.version;
+      const toOption = fromOption.cloneNode(true);
+      elements.compareFrom.append(fromOption);
+      elements.compareTo.append(toOption);
+    });
+    if (revisions.length) {
+      elements.compareFrom.value = String(revisions[0].version);
+      elements.compareTo.value = String(revisions.at(-1).version);
+    }
     [...revisions].reverse().forEach((revision, index) => {
       const item = createElement("article", "revision-item");
       const meta = createElement("div", "revision-meta");
@@ -569,10 +983,12 @@ async function loadPatient() {
   try {
     const detail = await getPatientDetail();
     renderPatient(detail.patient);
+    renderConflicts(detail.conflicts || []);
     renderHighlights(detail.highlights);
     renderTimeline(detail.entries, detail.highlights);
     renderSection(detail.sections || []);
     renderComments(detail.comments || []);
+    renderCommentTargets(detail.entries, detail.sections || []);
     renderPatientActions(detail.patient_actions || []);
     const isPatient = DEMO_CONTEXT.actorRole === "patient";
     if (!isPatient) {
@@ -588,6 +1004,9 @@ async function loadPatient() {
     elements.workspacePanel.hidden = isPatient;
     elements.staffNoteCard.hidden = DEMO_CONTEXT.actorRole !== "staff";
     elements.highlightComposerCard.hidden = DEMO_CONTEXT.actorRole !== "clinician";
+    elements.aiIngestCard.hidden = !["staff", "clinician", "admin"].includes(
+      DEMO_CONTEXT.actorRole,
+    );
     elements.sectionContent.disabled = DEMO_CONTEXT.actorRole !== "clinician";
     elements.saveSection.disabled = DEMO_CONTEXT.actorRole !== "clinician";
     const isEmpty = detail.highlights.length === 0 && detail.entries.length === 0;
@@ -595,7 +1014,9 @@ async function loadPatient() {
     return detail;
   } catch (error) {
     clearPatient();
-    if (error instanceof ApiError && error.status === 403) {
+    if (error instanceof ApiError && error.status === 401) {
+      showLogin();
+    } else if (error instanceof ApiError && error.status === 403) {
       setScreenState("forbidden");
     } else if (error instanceof ApiError && error.status === 404) {
       setScreenState("notFound");
@@ -608,12 +1029,31 @@ async function loadPatient() {
 }
 
 elements.retryButton.addEventListener("click", loadPatient);
-elements.demoRole.addEventListener("change", () => {
-  setDemoRole(elements.demoRole.value);
-  selectedHighlightSource = null;
-  elements.selectedSource.textContent = "No source text selected.";
-  elements.createHighlight.disabled = true;
-  loadPatient();
+elements.loginButton.addEventListener("click", async () => {
+  elements.loginButton.disabled = true;
+  showFeedback(elements.loginFeedback, "Signing in…");
+  try {
+    const session = await login(
+      elements.loginUsername.value.trim(),
+      elements.loginPassword.value,
+    );
+    showAuthenticatedSession(session);
+    await loadPatient();
+  } catch (error) {
+    showFeedback(elements.loginFeedback, error.message, true);
+  } finally {
+    elements.loginButton.disabled = false;
+  }
+});
+elements.loginPassword.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") elements.loginButton.click();
+});
+elements.logoutButton.addEventListener("click", async () => {
+  try {
+    await logout();
+  } finally {
+    showLogin();
+  }
 });
 elements.addEntry.addEventListener("click", async () => {
   const title = elements.entryTitle.value.trim();
@@ -682,7 +1122,11 @@ elements.createHighlight.addEventListener("click", async () => {
       risk_reason: reason,
       suggested_action: action,
       patient_instruction: elements.highlightPatientInstruction.value.trim() || null,
-      priority: Number(elements.highlightPriority.value),
+      risk_level: elements.highlightRiskLevel.value,
+      clinical_entities: elements.highlightEntities.value
+        .split(",")
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean),
       status: elements.highlightStatus.value,
       assigned_to: elements.highlightAssignee.value || null,
     });
@@ -691,6 +1135,7 @@ elements.createHighlight.addEventListener("click", async () => {
     elements.highlightReason.value = "";
     elements.highlightAction.value = "";
     elements.highlightPatientInstruction.value = "";
+    elements.highlightEntities.value = "";
     await loadPatient();
     showFeedback(elements.highlightCreateFeedback, "Highlight created and audited.");
   } catch (error) {
@@ -715,6 +1160,38 @@ elements.saveSection.addEventListener("click", async () => {
   }
 });
 elements.showHistory.addEventListener("click", renderHistory);
+elements.compareVersions.addEventListener("click", async () => {
+  try {
+    const comparison = await compareSectionRevisions(
+      "plan",
+      Number(elements.compareFrom.value),
+      Number(elements.compareTo.value),
+    );
+    elements.versionCompareOutput.hidden = false;
+    elements.versionCompareOutput.textContent = comparison.diff || "No differences.";
+  } catch (error) {
+    showFeedback(elements.sectionFeedback, error.message, true);
+  }
+});
+elements.commentOnPlanSelection.addEventListener("click", () => {
+  const start = elements.sectionContent.selectionStart;
+  const end = elements.sectionContent.selectionEnd;
+  if (start === end) {
+    showFeedback(elements.commentFeedback, "Select text in the Care Plan first.", true);
+    return;
+  }
+  selectedCommentSpanTarget = {
+    resource_type: "section",
+    resource_id: "plan",
+    start,
+    end,
+  };
+  showFeedback(
+    elements.commentFeedback,
+    `Comment will attach to Care Plan characters ${start}–${end}.`,
+  );
+  elements.commentContent.focus();
+});
 elements.addComment.addEventListener("click", async () => {
   const content = elements.commentContent.value.trim();
   if (!content) {
@@ -722,8 +1199,10 @@ elements.addComment.addEventListener("click", async () => {
     return;
   }
   try {
-    await addComment(content, elements.commentAssignee.value, replyToCommentId);
+    const target = replyToCommentId ? null : selectedCommentTarget();
+    await addComment(content, elements.commentAssignee.value, replyToCommentId, target);
     replyToCommentId = null;
+    selectedCommentSpanTarget = null;
     elements.commentContent.value = "";
     elements.commentAssignee.value = "";
     showFeedback(elements.commentFeedback, "Comment added.");
@@ -732,4 +1211,79 @@ elements.addComment.addEventListener("click", async () => {
     showFeedback(elements.commentFeedback, error.message, true);
   }
 });
-loadPatient();
+elements.aiIngest.addEventListener("click", async () => {
+  const title = elements.aiTitle.value.trim();
+  const rawText = elements.aiRawText.value.trim();
+  if (!title || !rawText) {
+    showFeedback(elements.aiFeedback, "Enter a title and source text first.", true);
+    return;
+  }
+  elements.aiIngest.disabled = true;
+  showFeedback(elements.aiFeedback, "Redacting and summarizing…");
+  try {
+    const result = await ingestAI(title, rawText, elements.aiSource.value);
+    const redacted = Object.values(result.redaction_counts).reduce((sum, value) => sum + value, 0);
+    showFeedback(
+      elements.aiFeedback,
+      `AI summary created for clinical review; ${redacted} identifier(s) redacted.`,
+    );
+    elements.aiRawText.value = "";
+    await loadPatient();
+  } catch (error) {
+    showFeedback(elements.aiFeedback, error.message, true);
+  } finally {
+    elements.aiIngest.disabled = false;
+  }
+});
+elements.recordAudio.addEventListener("click", async () => {
+  if (mediaRecorder?.state === "recording") {
+    mediaRecorder.stop();
+    elements.recordAudio.textContent = "Start recording";
+    return;
+  }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    showFeedback(elements.aiFeedback, "Audio recording is unavailable in this browser.", true);
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.addEventListener("dataavailable", (event) => audioChunks.push(event.data));
+    mediaRecorder.addEventListener("stop", async () => {
+      stream.getTracks().forEach((track) => track.stop());
+      const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || "audio/webm" });
+      showFeedback(elements.aiFeedback, "Transcribing recording…");
+      try {
+        const transcript = await transcribeAudio(blob);
+        elements.aiRawText.value = transcript.text;
+        const detail = transcript.diarization_available
+          ? "Speaker labels are available."
+          : "Speaker identity was not inferred; segments are marked unknown.";
+        showFeedback(elements.aiFeedback, `Transcription ready. ${detail}`);
+      } catch (error) {
+        showFeedback(elements.aiFeedback, error.message, true);
+      }
+    });
+    mediaRecorder.start();
+    elements.recordAudio.textContent = "Stop and transcribe";
+    showFeedback(elements.aiFeedback, "Recording locally…");
+  } catch (error) {
+    showFeedback(elements.aiFeedback, `Microphone access failed: ${error.message}`, true);
+  }
+});
+async function bootstrap() {
+  try {
+    const session = await getSession();
+    showAuthenticatedSession(session);
+    await loadPatient();
+  } catch {
+    showLogin();
+  }
+}
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/static/service-worker.js").catch(() => {});
+}
+
+bootstrap();

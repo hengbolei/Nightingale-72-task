@@ -1,59 +1,87 @@
 # Nightingale Care Note — Technical Brief
 
-## Product decision
+## Product thesis and scope
 
-This prototype optimizes for one clinical question: can a care-team member understand what needs
-attention, why it matters, and where the claim came from in ten seconds? It therefore implements a
-narrow single-patient vertical slice instead of a general-purpose EHR or document editor. All data
-is deterministic and synthetic.
+Nightingale is a provenance-first longitudinal care note for a synthetic patient. The primary
+product question is: can a care-team member understand what needs attention, why it matters, what
+action remains open, and where each claim came from within ten seconds?
+
+The implementation deliberately favors a narrow, auditable vertical slice over a general-purpose
+EHR or document editor. It combines patient, staff, clinician, and AI-scribed information in one
+timeline; derives a deterministic Glance ranking; exposes claim-level evidence; supports scoped
+comments and versioned care-plan editing; and prevents unreviewed AI content from becoming
+patient-facing guidance.
+
+All bundled records are deterministic and synthetic. This is an evaluation prototype, not a
+medical device or a production clinical system.
 
 ## Architecture and trust boundaries
 
 ```mermaid
 flowchart LR
-    Browser[Responsive web client] --> API[FastAPI routes]
-    API --> Identity[Development identity headers]
+    Browser[Responsive PWA client] -->|signed HttpOnly session| API[FastAPI routes]
+    API --> Identity[Account, session, membership checks]
     API --> Service[CareNoteService policy boundary]
-    Service --> Repo[In-memory repository]
-    Repo --> Data[Synthetic patient data]
-    FutureLLM[Future external LLM adapter] --> Redaction[PHI redaction gateway]
-    Redaction --> Service
+    Service --> Rank[Deterministic importance scorer]
+    Service --> Conflict[Medication / dose / allergy detector]
+    Service --> Memory[In-memory development adapter]
+    Service --> PG[Encrypted PostgreSQL adapter]
+    PG --> RLS[Forced clinic RLS]
+    PG --> Cold[Encrypted cold-entry archive]
+    Service --> Redaction[PHI redaction boundary]
+    Redaction --> OpenAI[Optional Responses / transcription APIs]
+    API <--> WS[Authorized WebSocket presence and refresh]
 ```
 
-The browser is not a security boundary. Clinic scope, patient self-access, section ownership,
-comment access, authorship and optimistic concurrency are checked on the server. Development
-headers make the prototype easy to demonstrate but are not authentication. A production path must
-verify signed identities, use PostgreSQL row-level security, encrypt data in transit and at rest,
-and retain auditable metadata under an explicit retention policy.
+The browser is never an authorization boundary. Login produces an HMAC-signed, expiring token
+whose claims bind actor, role, clinic, session ID, issue time, and expiry. The token is also set as
+an HttpOnly, SameSite cookie. Server-side session state supports revocation and PostgreSQL stores
+only a hash of the session ID. `system` cannot receive an interactive session, and legacy
+actor/role/clinic request headers are not accepted.
 
-The patient response uses an explicit publication rule rather than merely hiding internal UI.
-It returns only patient-authored public entries plus a reduced `PatientAction` projection for a
-Highlight that is both clinician-confirmed and supplied with a separate patient-facing
-instruction. The projection omits provenance, internal risk reasoning, assignment and staff
-comments. Draft or AI-suggested patient instructions remain server-side.
+`CareNoteService` enforces patient self-access, clinic scope, role ownership, authorship,
+optimistic concurrency, publication rules, provenance integrity, and conflict adjudication.
+PostgreSQL adds defense in depth: clinic-scoped tables use forced RLS against the transaction-local
+`app.current_clinic_id`. Clinical snapshots and cold archives are authenticated-encrypted before
+database storage.
 
-No external LLM is connected. A deterministic `PHIRedactionGateway` is present as the mandatory
-boundary for any future model adapter. It removes caller-supplied known names, Singapore identity
-numbers and Singapore/China phone numbers. This is a tested boundary, not a claim of comprehensive
-clinical de-identification; a production gateway would need broader entity recognition, policy
-versioning, human review and adversarial evaluation.
+The default adapter remains in memory for reproducible evaluation. PostgreSQL migrations and the
+adapter are implemented, but this repository has not been validated against the target managed
+database. Production use therefore still requires real migration, cross-clinic RLS, backup,
+restore, failover, and key-rotation tests.
 
-## Data relationships
+## Core data model
 
 ```mermaid
 erDiagram
+    CLINIC ||--o{ MEMBERSHIP : contains
+    ACCOUNT ||--o{ SESSION : opens
+    ACCOUNT ||--o{ MEMBERSHIP : has
+    CLINIC ||--o{ PATIENT : serves
     PATIENT ||--o{ TIMELINE_ENTRY : has
     PATIENT ||--o{ SECTION_STATE : has
     PATIENT ||--o{ COMMENT : discusses
     PATIENT ||--o{ HIGHLIGHT : prioritizes
-    TIMELINE_ENTRY ||--o{ HIGHLIGHT : sourced_by
+    PATIENT ||--o{ CONFLICT : flags
+    SOURCE_ARTIFACT ||--o{ TIMELINE_ENTRY : supports
+    TIMELINE_ENTRY ||--o{ HIGHLIGHT : summarized_by
+    SOURCE_ARTIFACT ||--o{ HIGHLIGHT : proves_claim
     SECTION_STATE ||--o{ SECTION_REVISION : versions
     COMMENT o|--o{ COMMENT : replies_to
+    COMMENT ||--o{ RESOURCE_REVISION : snapshots
+    HIGHLIGHT ||--o{ RESOURCE_REVISION : snapshots
+    CONFLICT ||--o{ RESOURCE_REVISION : snapshots
+    HIGHLIGHT ||--o{ IMPORTANCE_FEEDBACK : receives
+    PATIENT ||--o{ AUDIT_EVENT : records
+    AUDIT_EVENT ||--o| AUDIT_EVENT : hash_chains
 
     TIMELINE_ENTRY {
       uuid id
+      uuid patient_id
       uuid clinic_id
       enum author_role
+      uuid author_id
+      datetime timestamp
       enum type
       text content
       json origin
@@ -61,103 +89,142 @@ erDiagram
     }
     HIGHLIGHT {
       uuid id
+      text text
       int priority
+      json priority_factors
       text risk_reason
       text suggested_action
-      enum status
+      enum review_status
       enum action_status
-      enum assigned_to
       int version
-      uuid provenance_entry_id
-      int span_start
-      int span_end
-    }
-    SECTION_STATE {
-      string section
-      enum owner_role
-      text content
-      int version
-    }
-    SECTION_REVISION {
-      int version
-      text content_snapshot
-      uuid changed_by
-      datetime changed_at
-      string operation
+      json timeline_span
+      json original_evidence_span
     }
     COMMENT {
       uuid id
       uuid parent_id
+      json entry_section_or_span_target
       enum author_role
       text content
       enum assigned_to
       bool resolved
+      int version
+    }
+    CONFLICT {
+      uuid id
+      enum category
+      string entity
+      enum status
+      uuid preferred_entry_id
+      text resolution_note
+      int version
     }
 ```
 
-Three AI-scribed types are independent timeline entries: doctor consult, nurse consult and patient
-session summaries. They retain source labels and review status and never impersonate a clinician.
-A highlight points to an exact entry and character span; the repository rejects missing,
-cross-patient or out-of-bounds sources.
+The timeline distinguishes doctor–patient AI summaries, nurse–patient AI summaries, and
+AI–patient session summaries from manual patient, staff, and clinician notes. AI entries use
+`author_role=system`, retain their interaction type and original artifact pointer, and are visibly
+marked as unconfirmed.
 
-Internal collaborators can assign each highlight and move its action through open, in-progress,
-and completed states. Clinician confirmation and rejection remain limited to clinicians and
-admins. Every update uses an expected version to prevent stale writes and emits a metadata-only
-audit event. The web client renders the exact source span and includes a synthetic role switcher
-for demonstrating server-side patient filtering.
+Provenance has two independently validated hops. A Highlight first points to an exact character
+span in a Timeline entry. It also stores a claim-level pointer to an exact span in the original
+message, transcript, or manual note. The repository rejects missing, cross-patient, or
+out-of-bounds timeline spans. Non-verbatim generated claims require explicit original-source
+offsets instead of silently treating an entire transcript as evidence.
 
-Staff can add a manual Timeline note through a role-derived server operation: the browser supplies
-only title and content, while the service assigns author, clinic and entry type. A clinician can
-select an exact span from an existing manual or AI entry and create a new Highlight. The server
-derives the Highlight text from the stored source rather than trusting client-supplied text, then
-records both note and Highlight creation in the audit stream.
+Comments bind to a whole entry, a whole section, or an exact character range. Comments support
+replies, role mentions, assignment, resolve/reopen, optimistic locking, and complete snapshots.
+Highlights and conflicts also store full revision snapshots. Care-plan sections store full content
+snapshots plus unified diffs and can be restored by creating a new auditable version. Comment,
+Highlight, and Conflict restore operations are not yet implemented; their history is viewable and
+comparable but not revertible.
 
-Comment creation, replies, resolve/reopen, patient-authored updates, Highlight review,
-assignment/completion, section edits and reverts all emit metadata-only audit events. Comment
-resolution increments a lightweight comment version so successive lifecycle changes remain
-distinguishable without copying comment text into the audit stream.
+## Importance, learning, conflict, and patient safety
 
-Comments support reply relationships, role mentions, assignment, resolve and reopen. Section
-edits store complete snapshots and unified diffs. A separate audit stream contains actor, time,
-resource, version and operation metadata but no clinical body text. A matching expected version is required, so stale writes return a
-conflict rather than silently overwriting another user. Revert creates a new auditable version; it
-does not delete history.
+Glance ranking is deterministic. Each displayed total is recomputed from visible factors:
 
-## Importance logic
+- explicit risk level;
+- recency relative to the latest entry;
+- safety-sensitive entity categories such as medication, dose, allergy, and symptom;
+- open, in-progress, or completed action state;
+- clinician-confirmed or rejected review state; and
+- clinician authorship.
 
-The synthetic Glance ranking is deterministic. Clinician-confirmed medication action ranks above
-an unconfirmed low blood-pressure observation, which ranks above an unresolved AI-derived task.
-Every item exposes its score, risk reason, action and exact source. This favors explainability over
-a black-box ranking model. The bonus self-learning mechanism is intentionally not implemented:
-care-team feedback must not silently mutate clinical truth.
+No model-reported confidence is used. Safety factors create a stable floor, completed work is
+demoted, and rejected suggestions remain visible in history. Initial seed scores, live scores, and
+revision snapshots use the same scorer so the number does not change merely because a view was
+opened.
 
-## Performance evidence
+The adaptive component records impressions separately from human review outcomes. It activates
+only after three reviewed items with a matching clinical-entity signature, caps its adjustment at
+plus or minus eight points, and shrinks the adjustment when reviewed items are a small fraction of
+exposures. This is a bounded workflow preference signal, not learned clinical truth. The current
+prototype learns from confirm/reject outcomes; manual edits and comment signals are a documented
+next step.
 
-The benchmark calls the real FastAPI route through its test client after warm-up, using the seeded
-dataset (one patient, six timeline entries, three highlights, one section). Run:
+Conflict detection intentionally abstains outside a narrow, auditable scope. Deterministic patterns
+extract medication state, dose, and allergy polarity. A clinician-authored fact receives explicit
+precedence, while the contradiction remains visible until a clinician or admin confirms or resolves
+it with a note. Detection, confirmation, reopening, and resolution have persistent snapshots and
+metadata-only audit events.
 
-```powershell
-.\.venv\Scripts\python.exe scripts\benchmark_glance.py --iterations 1000 --warmup 100
-```
+Patient-facing output follows a stricter publication rule. Patients cannot access raw AI entries,
+internal comments, assignments, provenance, or internal risk reasoning. They receive only public
+patient-authored entries and a reduced action projection when a Highlight is clinician-confirmed
+and has a separate patient instruction. AI-suggested guidance is never published directly.
 
-The result is machine- and adapter-specific and is recorded in `docs/PERFORMANCE.md`. Passing the
-300 ms prototype target with an in-memory adapter is not evidence that a production database,
-network or representative clinical dataset will meet the same target.
+## AI, privacy, audit, and lifecycle
 
-## Assumptions and trade-offs
+The optional text-ingestion path stores the original source internally, removes known patient names,
+medical-record identifiers, supported national IDs, and Singapore/China phone patterns, then calls
+the OpenAI Responses API with `store=false` and a hashed safety identifier. The prompt instructs
+the model to preserve uncertainty and avoid inventing diagnoses, doses, allergies, dates, or
+certainty. The resulting Timeline entry remains `ai_suggested` until human review. Without an API
+key, the adapter fails closed with a service-unavailable response.
 
-- A single synthetic patient is enough to prove the vertical slice, not scalability.
-- Full section snapshots are clearer and safer than compact diffs at prototype scale.
-- Optimistic locking is deterministic; live co-editing and automatic merge are out of scope.
-- Vanilla JavaScript minimizes build risk but gives fewer editor and component primitives.
-- The in-memory adapter makes tests reproducible but deliberately resets on restart.
-- Metadata-only audit records avoid duplicating sensitive body text into logs; revision snapshots
-  remain clinical data and require the same storage protections as current content.
+Browser recording and transcription are implemented as an optional clinical workflow. The
+transcript schema preserves speaker, timestamp, and confidence fields when a provider returns them
+and uses `unknown`/`null` rather than inventing values. A strict unresolved privacy gap remains:
+external transcription receives audio before text redaction is possible. Production deployment
+must use an approved transcription boundary—such as local/on-premises ASR or a covered compliant
+processor—before claiming pre-model PHI redaction. Patient-side voice capture and validated
+diarization, code-switching, overlap, and noisy-room handling are also not complete.
 
-## Production gaps
+Request logs contain method, path, response status, and duration only; they omit query values,
+headers, cookies, and bodies. Audit events contain actor, resource, operation, version, and time,
+not clinical content. Each event includes the previous event hash and its own canonical SHA-256
+hash. PostgreSQL writes an additional audit-chain anchor. This is tamper-evident, not immutable
+WORM storage; a production system must export anchors to an immutable compliance destination.
 
-Production readiness requires signed authentication, durable storage and RLS, comprehensive PHI
-policy enforcement, TLS and key management, immutable audit controls, monitoring, retention and
-deletion workflows, accessibility/usability validation, clinical safety review, representative
-load testing and regulatory assessment. This repository is a demonstration prototype, not a
-medical device.
+The cold-storage policy selects staff or patient entries older than 180 days only when they are not
+referenced by a Highlight or unresolved conflict and do not match a narrow safety pattern. It keeps
+a compressed extractive summary and encrypted reversible original. This proves lifecycle logic but
+does not replace production object storage, legal holds, retention approval, or restore drills.
+
+## Performance and verification
+
+The benchmark exercises the real FastAPI route through `TestClient` after 100 warm-up requests and
+measures 1,000 sequential requests against the single-patient in-memory dataset. The latest local
+run measured 1.535 ms P95, below the 300 ms prototype target. It excludes a real network,
+PostgreSQL, concurrent users, and representative longitudinal volume, so it is not a production
+capacity claim.
+
+The automated suite currently contains 45 passing tests covering bidirectional RBAC, patient
+filtering, signed-token tampering and expiry, different-role concurrent edits, stale same-section
+writes, arbitrary section diffs, provenance resolution, exact section comment spans, allergy
+conflicts, resource histories, AI redaction, and authorized WebSocket presence.
+
+## Deliberate trade-offs and next steps
+
+- A single synthetic patient proves the vertical slice, not clinic-scale administration.
+- Vanilla JavaScript minimizes build risk but does not provide a rich collaborative editor.
+- Optimistic locking is deterministic; automatic merge and live cursor-level co-editing are absent.
+- Complete snapshots improve prototype auditability at the cost of storage volume.
+- The PostgreSQL adapter stores one encrypted clinical snapshot per clinic for implementation
+  speed; normalized production tables would improve queryability and independent retention.
+- Formal enterprise identity, MFA/SSO, managed TLS certificates, KMS rotation, immutable audit
+  export, real PostgreSQL/RLS tests, approved model validation, accessibility/usability studies,
+  and clinical safety review remain required before production use.
+
+The prototype's central trust decision is to make uncertainty and evidence visible, keep machine
+output unconfirmed, and require a human publication boundary where an error could reach a patient.

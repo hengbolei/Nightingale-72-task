@@ -1,29 +1,49 @@
 import re
+from datetime import UTC, datetime
 from difflib import unified_diff
 from uuid import UUID, uuid4
 
 from nightingale.domain.models import (
     ActionStatus,
     Actor,
+    AIIngestRequest,
+    AIIngestResponse,
+    AnnotationTarget,
+    AnnotationTargetType,
+    ArchiveBatch,
+    ArchiveCandidate,
     AuditEvent,
     Comment,
+    Conflict,
+    ConflictStatus,
+    ConflictUpdateRequest,
     EntryOrigin,
     EntryType,
     Highlight,
     HighlightCreateRequest,
     HighlightUpdateRequest,
+    ImportanceFeedback,
     PatientAction,
     PatientDetailResponse,
     ProvenancePointer,
     ProvenanceSource,
+    ResourceRevision,
     ReviewStatus,
     Role,
+    SectionDiff,
     SectionRevision,
     SectionState,
+    SourceArtifact,
+    SourceArtifactKind,
+    SourceArtifactPointer,
+    SourceEvidence,
     TimelineEntry,
     utc_now,
 )
 from nightingale.repositories.memory import InMemoryCareNoteRepository
+from nightingale.services.ai import OpenAIClinicalGateway
+from nightingale.services.conflicts import DeterministicConflictDetector
+from nightingale.services.importance import DeterministicImportanceScorer
 
 AI_ENTRY_TYPES = {
     EntryType.AI_DOCTOR_CONSULT_SUMMARY,
@@ -45,10 +65,19 @@ class PatientNotFoundError(LookupError):
 
 
 class CareNoteService:
-    def __init__(self, repository: InMemoryCareNoteRepository) -> None:
+    def __init__(
+        self,
+        repository: InMemoryCareNoteRepository,
+        ai_gateway: OpenAIClinicalGateway | None = None,
+    ) -> None:
         self.repository = repository
+        self.importance_scorer = DeterministicImportanceScorer()
+        self.conflict_detector = DeterministicConflictDetector()
+        self.ai_gateway = ai_gateway or OpenAIClinicalGateway()
 
     def get_patient_view(self, actor: Actor, patient_id: UUID) -> PatientDetailResponse:
+        if actor.role not in {Role.PATIENT, Role.STAFF, Role.CLINICIAN, Role.ADMIN}:
+            raise AccessDeniedError("this role cannot open an interactive patient view")
         patient = self.repository.get_patient(patient_id, actor.clinic_id)
         if patient is None:
             raise PatientNotFoundError("patient not found in actor's clinic")
@@ -73,11 +102,14 @@ class CareNoteService:
             ]
             sections: list[SectionState] = []
             comments: list[Comment] = []
+            conflicts = []
         else:
-            highlights = self.repository.list_highlights(patient_id)
+            highlights = self._rank_highlights(patient_id, entries)
             patient_actions = []
             sections = self.repository.list_sections(patient_id, actor.clinic_id)
             comments = self.repository.list_comments(patient_id, actor.clinic_id)
+            self.repository.sync_conflicts(self.conflict_detector.detect(patient_id, entries))
+            conflicts = self.repository.list_conflicts(patient_id, actor.clinic_id)
         return PatientDetailResponse(
             patient=patient,
             highlights=highlights,
@@ -85,6 +117,68 @@ class CareNoteService:
             patient_actions=patient_actions,
             sections=sections,
             comments=comments,
+            conflicts=conflicts,
+        )
+
+    def _rank_highlights(self, patient_id: UUID, entries: list[TimelineEntry]) -> list[Highlight]:
+        if not entries:
+            return []
+        by_id = {entry.id: entry for entry in entries}
+        reference_time = max(entry.timestamp for entry in entries)
+        ranked = [
+            self.importance_scorer.score(
+                highlight,
+                by_id[highlight.provenance_pointer.entry_id],
+                reference_time,
+                self.repository.importance_adjustment(highlight),
+            )
+            for highlight in self.repository.list_highlights(patient_id)
+            if highlight.provenance_pointer.entry_id in by_id
+        ]
+        return sorted(ranked, key=lambda item: item.priority, reverse=True)
+
+    def get_source_evidence(self, actor: Actor, patient_id: UUID, entry_id: UUID) -> SourceEvidence:
+        self._require_internal_collaborator(actor)
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        entry = self.repository.get_entry(entry_id)
+        if entry is None or entry.patient_id != patient_id or entry.clinic_id != actor.clinic_id:
+            raise LookupError("timeline entry does not exist")
+        pointer = entry.origin.source_pointer
+        if pointer is None:
+            raise LookupError("this entry has no resolvable original source")
+        artifact = self.repository.get_source_artifact(
+            pointer.source_id, patient_id, actor.clinic_id
+        )
+        if artifact is None or pointer.end > len(artifact.content):
+            raise LookupError("original source does not exist")
+        return SourceEvidence(
+            artifact=artifact,
+            pointer=pointer,
+            excerpt=artifact.content[pointer.start : pointer.end],
+        )
+
+    def get_highlight_source_evidence(
+        self, actor: Actor, patient_id: UUID, highlight_id: UUID
+    ) -> SourceEvidence:
+        self._require_internal_collaborator(actor)
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        highlight = self.repository.get_highlight(highlight_id)
+        if highlight is None or highlight.patient_id != patient_id:
+            raise LookupError("highlight does not exist")
+        pointer = highlight.source_evidence_pointer
+        if pointer is None:
+            raise LookupError("highlight has no claim-level source evidence")
+        artifact = self.repository.get_source_artifact(
+            pointer.source_id, patient_id, actor.clinic_id
+        )
+        if artifact is None or pointer.end > len(artifact.content):
+            raise LookupError("claim-level source evidence does not exist")
+        return SourceEvidence(
+            artifact=artifact,
+            pointer=pointer,
+            excerpt=artifact.content[pointer.start : pointer.end],
         )
 
     def add_comment(
@@ -94,6 +188,7 @@ class CareNoteService:
         content: str,
         assigned_to: Role | None = None,
         parent_id: UUID | None = None,
+        target: AnnotationTarget | None = None,
     ) -> Comment:
         self._require_internal_collaborator(actor)
         if self.repository.get_patient(patient_id, actor.clinic_id) is None:
@@ -113,16 +208,36 @@ class CareNoteService:
                 or parent.clinic_id != actor.clinic_id
             ):
                 raise LookupError("parent comment does not exist")
+            if target is not None and target != parent.target:
+                raise ValueError("a reply must use the parent comment target")
+            target = parent.target
+        if target is None:
+            target = AnnotationTarget(
+                resource_type=AnnotationTargetType.SECTION,
+                resource_id="plan",
+            )
+        self._validate_annotation_target(patient_id, actor.clinic_id, target)
         saved = self.repository.add_comment(
             Comment(
                 patient_id=patient_id,
                 clinic_id=actor.clinic_id,
                 author_id=actor.id,
                 author_role=actor.role,
+                target=target,
                 parent_id=parent_id,
                 content=content,
                 mentions=mentions,
                 assigned_to=assigned_to,
+            )
+        )
+        self.repository.add_resource_revision(
+            ResourceRevision(
+                resource="comment",
+                resource_id=str(saved.id),
+                version=saved.version,
+                snapshot=saved.model_dump(mode="json"),
+                changed_by=actor.id,
+                operation="comment_reply" if parent_id is not None else "comment_create",
             )
         )
         self.repository.add_audit_event(
@@ -139,7 +254,12 @@ class CareNoteService:
         return saved
 
     def set_comment_resolved(
-        self, actor: Actor, patient_id: UUID, comment_id: UUID, resolved: bool
+        self,
+        actor: Actor,
+        patient_id: UUID,
+        comment_id: UUID,
+        resolved: bool,
+        expected_version: int,
     ) -> Comment:
         self._require_internal_collaborator(actor)
         comment = self.repository.get_comment(comment_id)
@@ -149,6 +269,10 @@ class CareNoteService:
             or comment.clinic_id != actor.clinic_id
         ):
             raise LookupError("comment does not exist")
+        if expected_version != comment.version:
+            raise ConcurrentEditError(
+                f"expected version {expected_version}, current version is {comment.version}"
+            )
         updated = comment.model_copy(
             update={
                 "resolved": resolved,
@@ -158,6 +282,17 @@ class CareNoteService:
             }
         )
         saved = self.repository.save_comment(updated)
+        operation = "comment_resolve" if resolved else "comment_reopen"
+        self.repository.add_resource_revision(
+            ResourceRevision(
+                resource="comment",
+                resource_id=str(saved.id),
+                version=saved.version,
+                snapshot=saved.model_dump(mode="json"),
+                changed_by=actor.id,
+                operation=operation,
+            )
+        )
         self.repository.add_audit_event(
             AuditEvent(
                 patient_id=patient_id,
@@ -165,7 +300,7 @@ class CareNoteService:
                 resource="comment",
                 resource_id=str(comment_id),
                 version=saved.version,
-                operation="comment_resolve" if resolved else "comment_reopen",
+                operation=operation,
                 changed_by=actor.id,
             )
         )
@@ -213,7 +348,34 @@ class CareNoteService:
             changes["completed_by"] = None
             changes["completed_at"] = None
 
-        saved = self.repository.save_highlight(current.model_copy(update=changes))
+        candidate = current.model_copy(update=changes)
+        source = self.repository.get_entry(candidate.provenance_pointer.entry_id)
+        entries = self.repository.list_entries(patient_id, actor.clinic_id)
+        if source is None or not entries:
+            raise LookupError("highlight source does not exist")
+        if (
+            payload.status is not None
+            and payload.status is not current.status
+            and payload.status in {ReviewStatus.CLINICIAN_CONFIRMED, ReviewStatus.REJECTED}
+        ):
+            self.repository.add_importance_feedback(
+                ImportanceFeedback(
+                    patient_id=patient_id,
+                    clinic_id=actor.clinic_id,
+                    highlight_id=current.id,
+                    entity_signature=self._entity_signature(current),
+                    accepted=payload.status is ReviewStatus.CLINICIAN_CONFIRMED,
+                    actor_id=actor.id,
+                )
+            )
+        saved = self.repository.save_highlight(
+            self.importance_scorer.score(
+                candidate,
+                source,
+                max(entry.timestamp for entry in entries),
+                self.repository.importance_adjustment(candidate),
+            )
+        )
         operation = "highlight_update"
         if payload.action_status is not None and payload.action_status is not current.action_status:
             operation = (
@@ -241,6 +403,16 @@ class CareNoteService:
                 changed_by=actor.id,
             )
         )
+        self.repository.add_resource_revision(
+            ResourceRevision(
+                resource="highlight",
+                resource_id=str(saved.id),
+                version=saved.version,
+                snapshot=saved.model_dump(mode="json"),
+                changed_by=actor.id,
+                operation=operation,
+            )
+        )
         return saved
 
     def create_manual_entry(
@@ -260,6 +432,18 @@ class CareNoteService:
         if entry_type is None:
             raise AccessDeniedError("this role cannot author a timeline note")
         entry_id = uuid4()
+        source_id = f"manual-note-{entry_id}"
+        artifact = self.repository.add_source_artifact(
+            SourceArtifact(
+                id=source_id,
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                kind=SourceArtifactKind.MANUAL_NOTE,
+                source=ProvenanceSource.MANUAL_ENTRY,
+                label=f"{actor.role.value.title()} manual note source",
+                content=content,
+            )
+        )
         entry = TimelineEntry(
             id=entry_id,
             patient_id=patient_id,
@@ -271,8 +455,13 @@ class CareNoteService:
             content=content,
             origin=EntryOrigin(
                 source=ProvenanceSource.MANUAL_ENTRY,
-                source_id=f"manual-note-{entry_id}",
+                source_id=source_id,
                 source_label=f"{actor.role.value.title()} manual note",
+                source_pointer=SourceArtifactPointer(
+                    source_id=artifact.id,
+                    start=0,
+                    end=len(artifact.content),
+                ),
             ),
             review_status=(
                 ReviewStatus.CLINICIAN_CONFIRMED if actor.role is Role.CLINICIAN else None
@@ -292,6 +481,144 @@ class CareNoteService:
             )
         )
         return saved
+
+    def ingest_ai_summary(
+        self, actor: Actor, patient_id: UUID, payload: AIIngestRequest
+    ) -> AIIngestResponse:
+        self._require_internal_collaborator(actor)
+        patient = self.repository.get_patient(patient_id, actor.clinic_id)
+        if patient is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        summary, redaction = self.ai_gateway.summarize(
+            payload.raw_text,
+            [patient.display_name, patient.medical_record_number],
+            str(actor.id),
+        )
+        entry_id = uuid4()
+        source_id = f"ai-ingest-source-{entry_id}"
+        source_kind = (
+            SourceArtifactKind.TRANSCRIPT
+            if payload.source in {ProvenanceSource.DOCTOR_CONSULT, ProvenanceSource.NURSE_CONSULT}
+            else SourceArtifactKind.MESSAGE_THREAD
+        )
+        artifact = self.repository.add_source_artifact(
+            SourceArtifact(
+                id=source_id,
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                kind=source_kind,
+                source=payload.source,
+                label=f"Original {payload.source.value.replace('_', ' ')}",
+                content=payload.raw_text,
+            )
+        )
+        entry_type = {
+            ProvenanceSource.DOCTOR_CONSULT: EntryType.AI_DOCTOR_CONSULT_SUMMARY,
+            ProvenanceSource.NURSE_CONSULT: EntryType.AI_NURSE_CONSULT_SUMMARY,
+            ProvenanceSource.PATIENT_SESSION: EntryType.AI_PATIENT_SESSION_SUMMARY,
+        }.get(payload.source, EntryType.AI_PATIENT_SESSION_SUMMARY)
+        entry = self.repository.add_entry(
+            TimelineEntry(
+                id=entry_id,
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                author_role=Role.SYSTEM,
+                author_id=None,
+                type=entry_type,
+                title=payload.title,
+                content=summary,
+                origin=EntryOrigin(
+                    source=payload.source,
+                    source_id=source_id,
+                    source_label=artifact.label,
+                    source_pointer=SourceArtifactPointer(
+                        source_id=source_id, start=0, end=len(payload.raw_text)
+                    ),
+                ),
+                review_status=ReviewStatus.AI_SUGGESTED,
+                internal=True,
+            )
+        )
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="timeline_entry",
+                resource_id=str(entry.id),
+                version=1,
+                operation="ai_summary_ingest",
+                changed_by=actor.id,
+            )
+        )
+        return AIIngestResponse(
+            entry=entry,
+            redaction_counts=redaction.counts,
+            model=self.ai_gateway.model,
+        )
+
+    def archive_preview(self, actor: Actor, patient_id: UUID) -> ArchiveBatch:
+        if actor.role is not Role.ADMIN:
+            raise AccessDeniedError("only admins can run archive maintenance")
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        protected_ids = {
+            item.provenance_pointer.entry_id for item in self.repository.list_highlights(patient_id)
+        }
+        protected_ids.update(
+            entry_id
+            for conflict in self.repository.list_conflicts(patient_id, actor.clinic_id)
+            if conflict.status is not ConflictStatus.RESOLVED
+            for entry_id in conflict.entry_ids
+        )
+        candidates: list[ArchiveCandidate] = []
+        now = datetime.now(UTC)
+        safety_pattern = re.compile(
+            r"\b(?:allerg|\d+\s*(?:mg|mcg|g|ml)|medication)\b", re.IGNORECASE
+        )
+        for entry in self.repository.list_entries(patient_id, actor.clinic_id):
+            age_days = max(0, (now - entry.timestamp).days)
+            if (
+                age_days >= 180
+                and entry.id not in protected_ids
+                and entry.author_role in {Role.PATIENT, Role.STAFF}
+                and not safety_pattern.search(entry.content)
+            ):
+                candidates.append(
+                    ArchiveCandidate(
+                        entry_id=entry.id,
+                        title=entry.title,
+                        age_days=age_days,
+                        reason=(
+                            "Older than 180 days, low-signal, not referenced by a Highlight "
+                            "or unresolved conflict; original remains reversibly encrypted."
+                        ),
+                    )
+                )
+        return ArchiveBatch(
+            patient_id=patient_id,
+            candidates=candidates,
+            policy="cold-v1: age>=180d; preserve safety facts and referenced records",
+        )
+
+    def apply_archive(self, actor: Actor, patient_id: UUID, entry_ids: list[UUID]) -> int:
+        allowed = {item.entry_id for item in self.archive_preview(actor, patient_id).candidates}
+        requested = set(entry_ids)
+        if not requested <= allowed:
+            raise ValueError("one or more entries do not satisfy the current archive policy")
+        archived = self.repository.archive_entries(entry_ids)
+        for entry_id in entry_ids:
+            self.repository.add_audit_event(
+                AuditEvent(
+                    patient_id=patient_id,
+                    clinic_id=actor.clinic_id,
+                    resource="timeline_entry",
+                    resource_id=str(entry_id),
+                    version=1,
+                    operation="archive_to_encrypted_cold_storage",
+                    changed_by=actor.id,
+                )
+            )
+        return archived
 
     def create_highlight(
         self,
@@ -313,23 +640,43 @@ class CareNoteService:
             raise ValueError("highlight span must contain visible text")
         if payload.assigned_to in {Role.PATIENT, Role.SYSTEM}:
             raise AccessDeniedError("highlights can only be assigned to an internal care role")
+        entries = self.repository.list_entries(patient_id, actor.clinic_id)
+        highlight = Highlight(
+            patient_id=patient_id,
+            text=text,
+            risk_reason=payload.risk_reason,
+            suggested_action=payload.suggested_action,
+            patient_instruction=payload.patient_instruction,
+            risk_level=payload.risk_level,
+            clinical_entities=payload.clinical_entities,
+            priority=0,
+            status=payload.status,
+            assigned_to=payload.assigned_to,
+            provenance_pointer=ProvenancePointer(
+                entry_id=source.id,
+                start=payload.start,
+                end=payload.end,
+            ),
+            source_evidence_pointer=self._claim_source_pointer(source, text, payload),
+            updated_by=actor.id,
+            updated_at=utc_now(),
+        )
         highlight = self.repository.add_highlight(
-            Highlight(
-                patient_id=patient_id,
-                text=text,
-                risk_reason=payload.risk_reason,
-                suggested_action=payload.suggested_action,
-                patient_instruction=payload.patient_instruction,
-                priority=payload.priority,
-                status=payload.status,
-                assigned_to=payload.assigned_to,
-                provenance_pointer=ProvenancePointer(
-                    entry_id=source.id,
-                    start=payload.start,
-                    end=payload.end,
-                ),
-                updated_by=actor.id,
-                updated_at=utc_now(),
+            self.importance_scorer.score(
+                highlight,
+                source,
+                max(entry.timestamp for entry in entries),
+                self.repository.importance_adjustment(highlight),
+            )
+        )
+        self.repository.add_resource_revision(
+            ResourceRevision(
+                resource="highlight",
+                resource_id=str(highlight.id),
+                version=highlight.version,
+                snapshot=highlight.model_dump(mode="json"),
+                changed_by=actor.id,
+                operation="highlight_create",
             )
         )
         self.repository.add_audit_event(
@@ -345,12 +692,199 @@ class CareNoteService:
         )
         return highlight
 
+    def record_highlight_impression(
+        self, actor: Actor, patient_id: UUID, highlight_id: UUID, expected_version: int
+    ) -> None:
+        self._require_internal_collaborator(actor)
+        highlight = self.repository.get_highlight(highlight_id)
+        if highlight is None or highlight.patient_id != patient_id:
+            raise LookupError("highlight does not exist")
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        if highlight.version != expected_version:
+            raise ConcurrentEditError("highlight changed before the impression was recorded")
+        if not self.repository.has_highlight_impression(highlight_id, actor.id):
+            self.repository.add_importance_feedback(
+                ImportanceFeedback(
+                    patient_id=patient_id,
+                    clinic_id=actor.clinic_id,
+                    highlight_id=highlight.id,
+                    entity_signature=self._entity_signature(highlight),
+                    actor_id=actor.id,
+                )
+            )
+
+    @staticmethod
+    def _entity_signature(highlight: Highlight) -> str:
+        return "|".join(sorted({item.lower() for item in highlight.clinical_entities}))
+
+    def _claim_source_pointer(
+        self,
+        source: TimelineEntry,
+        highlight_text: str,
+        payload: HighlightCreateRequest,
+    ) -> SourceArtifactPointer | None:
+        entry_pointer = source.origin.source_pointer
+        if entry_pointer is None:
+            return None
+        artifact = self.repository.get_source_artifact(
+            entry_pointer.source_id, source.patient_id, source.clinic_id
+        )
+        if artifact is None:
+            return None
+        if payload.source_evidence_start is not None and payload.source_evidence_end is not None:
+            if payload.source_evidence_end > len(artifact.content):
+                raise ValueError("claim source span is outside the original artifact")
+            return SourceArtifactPointer(
+                source_id=artifact.id,
+                start=payload.source_evidence_start,
+                end=payload.source_evidence_end,
+            )
+        exact_start = artifact.content.find(highlight_text)
+        if exact_start >= 0:
+            return SourceArtifactPointer(
+                source_id=artifact.id,
+                start=exact_start,
+                end=exact_start + len(highlight_text),
+            )
+        if entry_pointer.start == 0 and entry_pointer.end == len(artifact.content):
+            raise ValueError(
+                "claim-level original source offsets are required when summary text is not verbatim"
+            )
+        return entry_pointer
+
     def list_revisions(self, actor: Actor, patient_id: UUID, section: str) -> list[SectionRevision]:
         self._require_internal_collaborator(actor)
         current = self.repository.get_section(patient_id, section)
         if current is None or current.clinic_id != actor.clinic_id:
             raise LookupError("section does not exist")
         return self.repository.list_revisions(patient_id, section)
+
+    def compare_section_versions(
+        self,
+        actor: Actor,
+        patient_id: UUID,
+        section: str,
+        from_version: int,
+        to_version: int,
+    ) -> SectionDiff:
+        revisions = self.list_revisions(actor, patient_id, section)
+        by_version = {revision.version: revision for revision in revisions}
+        before = by_version.get(from_version)
+        after = by_version.get(to_version)
+        if before is None or after is None:
+            raise LookupError("one or both section revisions do not exist")
+        return SectionDiff(
+            section=section,
+            from_version=from_version,
+            to_version=to_version,
+            diff="\n".join(
+                unified_diff(
+                    before.content.splitlines(),
+                    after.content.splitlines(),
+                    fromfile=f"{section}@{from_version}",
+                    tofile=f"{section}@{to_version}",
+                    lineterm="",
+                )
+            ),
+        )
+
+    def list_resource_revisions(
+        self, actor: Actor, patient_id: UUID, resource: str, resource_id: UUID
+    ) -> list[ResourceRevision]:
+        self._require_internal_collaborator(actor)
+        if self.repository.get_patient(patient_id, actor.clinic_id) is None:
+            raise PatientNotFoundError("patient not found in actor's clinic")
+        if resource == "highlight":
+            item = self.repository.get_highlight(resource_id)
+        elif resource == "comment":
+            item = self.repository.get_comment(resource_id)
+        elif resource == "conflict":
+            item = self.repository.get_conflict(resource_id)
+        else:
+            raise LookupError("unsupported revision resource")
+        if item is None or item.patient_id != patient_id:
+            raise LookupError(f"{resource} does not exist")
+        if resource in {"comment", "conflict"} and item.clinic_id != actor.clinic_id:
+            raise LookupError(f"{resource} does not exist")
+        return self.repository.list_resource_revisions(resource, str(resource_id))
+
+    def update_conflict(
+        self,
+        actor: Actor,
+        patient_id: UUID,
+        conflict_id: UUID,
+        payload: ConflictUpdateRequest,
+    ) -> Conflict:
+        if actor.role not in {Role.CLINICIAN, Role.ADMIN}:
+            raise AccessDeniedError("only clinicians or admins can adjudicate conflicts")
+        current = self.repository.get_conflict(conflict_id)
+        if (
+            current is None
+            or current.patient_id != patient_id
+            or current.clinic_id != actor.clinic_id
+        ):
+            raise LookupError("conflict does not exist")
+        if payload.expected_version != current.version:
+            raise ConcurrentEditError(
+                f"expected version {payload.expected_version}, current version is {current.version}"
+            )
+        saved = self.repository.save_conflict(
+            current.model_copy(
+                update={
+                    "status": payload.status,
+                    "resolution_note": payload.resolution_note,
+                    "version": current.version + 1,
+                    "updated_by": actor.id,
+                    "updated_at": utc_now(),
+                }
+            )
+        )
+        operation = (
+            "conflict_resolve" if payload.status is ConflictStatus.RESOLVED else "conflict_confirm"
+        )
+        self.repository.add_resource_revision(
+            ResourceRevision(
+                resource="conflict",
+                resource_id=str(saved.id),
+                version=saved.version,
+                snapshot=saved.model_dump(mode="json"),
+                changed_by=actor.id,
+                operation=operation,
+            )
+        )
+        self.repository.add_audit_event(
+            AuditEvent(
+                patient_id=patient_id,
+                clinic_id=actor.clinic_id,
+                resource="conflict",
+                resource_id=str(saved.id),
+                version=saved.version,
+                operation=operation,
+                changed_by=actor.id,
+            )
+        )
+        return saved
+
+    def _validate_annotation_target(
+        self, patient_id: UUID, clinic_id: UUID, target: AnnotationTarget
+    ) -> None:
+        if target.resource_type is AnnotationTargetType.ENTRY:
+            try:
+                entry_id = UUID(target.resource_id)
+            except ValueError as exc:
+                raise ValueError("entry comment target must contain a UUID") from exc
+            entry = self.repository.get_entry(entry_id)
+            if entry is None or entry.patient_id != patient_id or entry.clinic_id != clinic_id:
+                raise LookupError("comment target entry does not exist")
+            content = entry.content
+        else:
+            section = self.repository.get_section(patient_id, target.resource_id)
+            if section is None or section.clinic_id != clinic_id:
+                raise LookupError("comment target section does not exist")
+            content = section.content
+        if target.end is not None and target.end > len(content):
+            raise ValueError("comment target span is outside the target content")
 
     @staticmethod
     def _require_internal_collaborator(actor: Actor) -> None:
@@ -451,9 +985,7 @@ class CareNoteService:
         )
         revisions = self.repository.revisions[(patient_id, section)]
         revisions[-1] = revisions[-1].model_copy(update={"operation": "revert"})
-        self.repository.audit_events[-1] = self.repository.audit_events[-1].model_copy(
-            update={"operation": "revert"}
-        )
+        self.repository.replace_last_audit_operation("revert")
         return state
 
     def list_audit_events(self, actor: Actor, patient_id: UUID) -> list[AuditEvent]:

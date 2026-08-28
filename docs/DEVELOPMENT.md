@@ -3,79 +3,116 @@
 ## Requirements
 
 - Python 3.11 or later
-- Data currently lives only in memory and is cleared when the process restarts. This adapter is
-  not production storage.
+- Node.js for JavaScript syntax checks
+- Optional PostgreSQL 14+ for durable/RLS validation
+- Optional approved OpenAI project key for AI summary and transcription validation
 
-## Installation
+All bundled data is synthetic. Development defaults to the in-memory adapter and resets clinical
+state when the application process restarts.
+
+## Installation and start
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m uvicorn nightingale.main:app --reload
 ```
 
-## Start the application
+Open:
+
+- Application: `http://127.0.0.1:8000`
+- OpenAPI UI: `http://127.0.0.1:8000/docs`
+- Health: `http://127.0.0.1:8000/api/health`
+
+## Development accounts
+
+The browser signs in through `/api/auth/login`; actor IDs, roles, and clinic IDs are not supplied
+by client headers. Development-only credentials are:
+
+| Role | Username | Password |
+| --- | --- | --- |
+| Patient | `patient` | `patient-demo-2026` |
+| Staff | `staff` | `staff-demo-2026` |
+| Clinician | `clinician` | `clinician-demo-2026` |
+| Admin | `admin` | `admin-demo-2026` |
+
+Example cookie-backed API session:
 
 ```powershell
-uvicorn nightingale.main:app --reload
-```
+$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/api/auth/login" `
+  -WebSession $session `
+  -ContentType "application/json" `
+  -Body '{"username":"clinician","password":"clinician-demo-2026"}'
 
-Open `http://127.0.0.1:8000`. Interactive API documentation is available at
-`http://127.0.0.1:8000/docs`.
-
-## Synthetic demo API
-
-The development dataset uses fixed IDs so tests and demos are reproducible:
-
-- Patient: `20000000-0000-4000-8000-000000000001`
-- Clinic: `10000000-0000-4000-8000-000000000001`
-- Staff: `30000000-0000-4000-8000-000000000001`
-- Clinician: `40000000-0000-4000-8000-000000000001`
-
-```powershell
-$headers = @{
-  "x-actor-id" = "40000000-0000-4000-8000-000000000001"
-  "x-actor-role" = "clinician"
-  "x-clinic-id" = "10000000-0000-4000-8000-000000000001"
-}
 Invoke-RestMethod `
   -Uri "http://127.0.0.1:8000/api/patients/20000000-0000-4000-8000-000000000001" `
-  -Headers $headers
+  -WebSession $session
 ```
 
-These headers are a development identity seam, not a production authentication design.
+Sessions are signed, expire, can be revoked on logout, and reject an interactive `system` role.
+When PostgreSQL is enabled, active account membership is checked and hashed session IDs persist.
+
+## Optional PostgreSQL and production settings
+
+Copy `.env.example` into your secret-management workflow; do not commit populated secrets. The
+important settings are:
+
+- `NIGHTINGALE_DATABASE_URL`: enables the encrypted PostgreSQL adapter and RLS migration;
+- `NIGHTINGALE_TOKEN_SECRET`: signs session tokens;
+- `NIGHTINGALE_ENCRYPTION_KEY`: protects clinical snapshots and cold archives;
+- `NIGHTINGALE_PUBLIC_BASE_URL`: must be HTTPS in production;
+- `OPENAI_API_KEY`: explicitly enables external summary/transcription calls; and
+- `NIGHTINGALE_OPENAI_MODEL`: selects the Responses API model.
+
+Production mode refuses to start without the database URL, signing secret, encryption key, and an
+HTTPS public URL. Use a non-superuser PostgreSQL application role that cannot bypass RLS. The
+included migration is `migrations/001_postgres_rls.sql`; the reverse-proxy baseline is
+`deploy/nginx.conf`.
+
+No target PostgreSQL, TLS certificate, KMS, WORM audit store, or approved OpenAI key is bundled.
+Those environment-gated integrations must be validated before production use.
+
+## PHI and model boundary
+
+`PHIRedactionGateway` is called by the text-summary adapter before an external request. It removes
+known patient names/MRNs and supported ID/phone patterns. The request uses `store=false`; the
+generated entry remains AI-suggested.
+
+Audio transcription currently sends audio to the configured external transcription endpoint
+before text redaction is possible. Treat this as a documented prototype limitation. Clinical
+deployment requires approved local/on-premises ASR or a compliant covered transcription service.
 
 ## Verification
 
-Run the automated test suite and static checks directly:
-
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\ruff.exe check src tests
-.\.venv\Scripts\ruff.exe format --check src tests
+.\.venv\Scripts\pytest.exe -q
+.\.venv\Scripts\ruff.exe check .
+.\.venv\Scripts\ruff.exe format --check src tests scripts
 node --check src/nightingale/static/api.js
 node --check src/nightingale/static/app.js
+node --check src/nightingale/static/service-worker.js
 .\.venv\Scripts\python.exe scripts\benchmark_glance.py --iterations 1000 --warmup 100
 ```
 
-## Current security boundary
-
-`CareNoteService` enforces clinic scope, actor identity, and section ownership. Header-based
-identity is only a development seam. It must be replaced with middleware that verifies signed
-tokens, and database RLS must be added before production use. All tests and demonstrations must
-use synthetic data.
+The current local baseline is 45 passing tests. The performance result is specific to the
+single-patient in-memory adapter and is not a production capacity claim.
 
 ## Directory responsibilities
 
 ```text
 src/nightingale/
-├── api/           HTTP input and output; contains no authorization policy
-├── core/          Configuration and cross-cutting concerns
-├── data/          Deterministic synthetic development data
-├── domain/        Domain models and stable data contracts
-├── repositories/  Persistence ports and adapters
-├── services/      Use cases, RBAC, conflict, and provenance rules
-└── static/        Lightweight single-patient web interface
-tests/             Automated domain, authorization, API, and UI contract tests
-docs/              Architecture and development documentation
+├── api/           HTTP/WebSocket routes and dependency wiring
+├── core/          configuration, identity, encryption and safe logging
+├── data/          deterministic synthetic seed data
+├── domain/        models and request/response contracts
+├── privacy/       PHI redaction boundary
+├── repositories/  in-memory and encrypted PostgreSQL adapters
+├── services/      RBAC, provenance, ranking, conflicts, AI and realtime behavior
+└── static/        responsive PWA client
+tests/             automated unit, policy, API and integration tests
+migrations/        PostgreSQL schema and RLS policy
+deploy/            TLS reverse-proxy baseline
+docs/              technical brief, operations, demo and evidence
 ```

@@ -1,10 +1,12 @@
 from fastapi.testclient import TestClient
 
+from nightingale.core.identity import session_service
 from nightingale.data.seed import (
     DEMO_CLINIC_ID,
     DEMO_CLINICIAN_ID,
     DEMO_PATIENT_ID,
 )
+from nightingale.domain.models import Actor, Role
 from nightingale.main import app
 
 client = TestClient(app)
@@ -25,14 +27,16 @@ def test_patient_page_serves_accessible_app_shell_and_modules():
     assert 'id="comment-list"' in page.text
     assert 'type="module" src="/static/app.js"' in page.text
     assert "/api/patients/${context.patientId}" in api_module.text
-    assert '"x-actor-role": context.actorRole' in api_module.text
+    assert 'credentials: "same-origin"' in api_module.text
+    assert "/api/auth/login" in api_module.text
     assert "/sections/${section}/revisions" in api_module.text
     assert "/comments/${commentId}" in api_module.text
     assert "/highlights/${highlightId}" in api_module.text
     assert "/patients/${context.patientId}/entries" in api_module.text
     assert "/patients/${context.patientId}/highlights" in api_module.text
     assert "/patients/${context.patientId}/audit" in api_module.text
-    assert 'id="demo-role"' in page.text
+    assert "/entries/${entryId}/source" in api_module.text
+    assert 'id="login-panel"' in page.text
     assert 'id="staff-note-card"' in page.text
     assert 'id="highlight-composer-card"' in page.text
     assert 'id="audit-list"' in page.text
@@ -42,13 +46,16 @@ def test_patient_page_serves_accessible_app_shell_and_modules():
 
 
 def test_patient_api_supplies_every_field_required_by_frontend():
+    token, _ = session_service.issue(
+        Actor(
+            id=DEMO_CLINICIAN_ID,
+            role=Role.CLINICIAN,
+            clinic_id=DEMO_CLINIC_ID,
+        )
+    )
     response = client.get(
         f"/api/patients/{DEMO_PATIENT_ID}",
-        headers={
-            "x-actor-id": str(DEMO_CLINICIAN_ID),
-            "x-actor-role": "clinician",
-            "x-clinic-id": str(DEMO_CLINIC_ID),
-        },
+        headers={"authorization": f"Bearer {token}"},
     )
 
     assert response.status_code == 200
@@ -66,6 +73,8 @@ def test_patient_api_supplies_every_field_required_by_frontend():
             "risk_reason",
             "suggested_action",
             "priority",
+            "priority_factors",
+            "risk_level",
             "status",
             "provenance_pointer",
             "assigned_to",
@@ -75,6 +84,7 @@ def test_patient_api_supplies_every_field_required_by_frontend():
         <= highlight.keys()
         for highlight in body["highlights"]
     )
+    assert body["conflicts"]
     assert all(
         {
             "id",

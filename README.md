@@ -9,8 +9,10 @@ human-authored notes, source evidence, and access boundaries explicit.
 
 ## Current capabilities
 
-- A 10-second Glance view with prioritized highlights, risk reasons, suggested actions, and
-  review states.
+- A 10-second Glance view with deterministic explainable priority factors, risk reasons,
+  suggested actions, and review states.
+- Narrow medication, dose, and allergy conflict detection with explicit clinician precedence or
+  needs-review states.
 - An actionable highlight workflow with care-role assignment, open/in-progress/completed states,
   disposition notes, optimistic concurrency checks, and metadata-only audit events.
 - A longitudinal timeline containing patient, staff, clinician, and three distinct AI-scribed
@@ -19,22 +21,34 @@ human-authored notes, source evidence, and access boundaries explicit.
   forged by the browser.
 - Clinician-created highlights from an exact selected source span, with risk reason, suggested
   action, priority, assignment, and audit metadata.
-- Exact highlight provenance pointers that resolve to an entry and character span.
-- Exact source-span highlighting in the timeline and clinician/staff/patient demo-role switching.
+- Exact highlight provenance pointers that resolve to an entry and character span, then continue
+  to an original synthetic message or transcript span.
+- Exact source-span highlighting in the timeline and signed clinician/staff/patient demo sessions.
 - Server-side clinic scope, role ownership, and patient self-access checks.
 - Patient-facing filtering that excludes internal highlights and raw AI-scribed entries.
 - A patient-facing dashboard with explicitly published clinician-confirmed guidance, action
   progress, and a form for adding patient-authored symptom or question updates.
 - Deterministic section versioning, audit metadata, revert behavior, and optimistic concurrency
   checks.
-- Internal care-team comments with reply links, role mentions, assignment, and resolve/reopen.
-- Editable clinician plan with API-backed revision history and revert controls.
+- Internal care-team comments bound to entries, sections, or exact spans, with reply links, role
+  mentions, assignment, resolve/reopen, optimistic locking, and complete revision snapshots.
+- Editable clinician plan with API-backed revision history, arbitrary-version comparison, and
+  revert controls, plus complete Highlight revision snapshots.
 - An in-page metadata-only audit trail for note creation, comments/replies, resolve/reopen,
   highlight assignment/completion/review, plan edits, and reverts.
-- A tested PHI redaction gateway for any future external model adapter.
+- A tested PHI redaction gateway used by the optional external text-summary adapter.
 - Deterministic synthetic data for repeatable demonstrations and tests.
 - Responsive, English-only web interface with loading, empty, forbidden, not-found, and error
   states.
+- Signed, expiring sessions with HttpOnly cookies, logout revocation, PostgreSQL-backed accounts
+  and clinic memberships, and no interactive `system` identity.
+- Optional encrypted PostgreSQL snapshots with forced clinic RLS, encrypted cold-entry archives,
+  hash-chained audit events, request-log minimization, and a TLS reverse-proxy baseline.
+- WebSocket presence and automatic record refresh, arbitrary Comment/Highlight snapshot A/B
+  comparison, and a bounded reviewed-outcome priority adjustment that controls for exposure.
+- Optional OpenAI Responses API summary ingestion and audio transcription. The gateway redacts
+  known identifiers, requests non-storage, preserves original sources internally, and fails closed
+  when no API key is configured.
 
 ## Technology
 
@@ -43,8 +57,10 @@ human-authored notes, source evidence, and access boundaries explicit.
 - Pydantic domain models
 - Vanilla HTML, CSS, and JavaScript
 - Pytest and Ruff
+- PostgreSQL/psycopg and Fernet authenticated encryption (optional production adapter)
 
-The current repository adapter stores data in memory. Restarting the process resets the dataset.
+Development defaults to an in-memory repository. Setting `NIGHTINGALE_DATABASE_URL` selects the
+encrypted PostgreSQL adapter and runs the RLS migration.
 
 ## Quick start
 
@@ -69,17 +85,10 @@ Open:
 
 ## Synthetic demo identity
 
-The frontend can switch among fixed synthetic clinician, staff, and patient identities:
-
-| Entity | ID |
-| --- | --- |
-| Clinic | `10000000-0000-4000-8000-000000000001` |
-| Patient | `20000000-0000-4000-8000-000000000001` |
-| Staff | `30000000-0000-4000-8000-000000000001` |
-| Clinician | `40000000-0000-4000-8000-000000000001` |
-
-The header-based identity mechanism is a development seam only. It must not be treated as
-production authentication.
+The UI uses a server login and a signed, expiring HttpOnly session cookie. Development-only
+accounts are `patient`, `staff`, `clinician`, and `admin`; their passwords follow
+`<username>-demo-2026`. Actor IDs and role/clinic headers are never accepted from the browser.
+When PostgreSQL is configured, accounts, active memberships, and hashed session IDs are persisted.
 
 ## Verification
 
@@ -92,10 +101,11 @@ Run the complete automated test suite:
 Run static and formatting checks:
 
 ```powershell
-.\.venv\Scripts\ruff.exe check src tests
-.\.venv\Scripts\ruff.exe format --check src tests
+.\.venv\Scripts\ruff.exe check .
+.\.venv\Scripts\ruff.exe format --check src tests scripts
 node --check src/nightingale/static/api.js
 node --check src/nightingale/static/app.js
+node --check src/nightingale/static/service-worker.js
 .\.venv\Scripts\python.exe scripts\benchmark_glance.py --iterations 1000 --warmup 100
 ```
 
@@ -107,6 +117,7 @@ The required acceptance scenarios are organized in:
 - `tests/test_concurrent_edits.py`
 
 Additional tests cover the synthetic dataset, patient API, and frontend/API contract.
+The current local baseline is 45 passing tests.
 
 ## Architecture and trust boundaries
 
@@ -129,19 +140,27 @@ Implemented in the prototype:
 - Patient self-access restriction.
 - Patient response filtering for internal and raw AI content.
 - Full section snapshots and diffs, with a separate metadata-only audit event stream.
-- Deterministic PHI redaction gateway for future LLM adapters.
-- Reproducible Glance benchmark: 0.990 ms warm-path P95 in the recorded local run.
+- Deterministic PHI redaction gateway used before optional external text-summary requests.
+- Signed session tokens, expiration/revocation, PostgreSQL account/membership schema, and forced
+  clinic RLS policies.
+- Authenticated encryption of PostgreSQL clinical snapshots and cold archives; hash-chained audit
+  events with database anchors; metadata-only request logs and retention maintenance.
+- Optional, fail-closed external model and transcription adapters; no call occurs without an
+  explicitly configured project API key.
+- Reproducible Glance benchmark: 1.535 ms warm-path P95 in the latest recorded local run.
 
 Required before production:
 
-- Replace development headers with verified signed identity tokens.
-- Replace the in-memory adapter with PostgreSQL and database RLS.
-- Add TLS, encryption at rest, secret management, retention policies, and production audit
-  controls.
+- Validate the PostgreSQL adapter and RLS policies against the target managed PostgreSQL service.
+- Connect TLS certificates, a managed key/secret service, immutable audit export, legal holds,
+  backup/restore, and operational retention scheduling.
+- Replace the local password provisioning workflow with the organization's identity provider,
+  MFA/SSO, recovery, and account lifecycle process.
 - Repeat Glance load testing with a production-like database, network, concurrency, and
   representative dataset; the local in-memory result is not a capacity claim.
 
-No external LLM is connected in the current scaffold, so no patient content is sent to a model.
+No external LLM call occurs by default. `OPENAI_API_KEY` explicitly enables the model boundary;
+real clinical use still requires organizational privacy, retention, and validation approval.
 
 ## Project layout
 
@@ -151,6 +170,7 @@ src/nightingale/
 ├── core/          Application configuration
 ├── data/          Deterministic synthetic seed data
 ├── domain/        Domain models and API contracts
+├── privacy/       PHI redaction boundary
 ├── repositories/  Persistence adapters
 ├── services/      Use cases and policy enforcement
 └── static/        Patient web interface
@@ -167,6 +187,7 @@ docs/              Architecture and development documentation
 - `docs/DELIVERY_CHECKLIST.md`
 - `docs/PERFORMANCE.md`
 - `ATTRIBUTION.txt`
+- `SUBMISSION_CHECKLIST.md`
 
 ## License
 

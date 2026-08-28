@@ -1,4 +1,6 @@
+from nightingale.data.seed import DEMO_CLINIC_ID, DEMO_CLINICIAN_ID, DEMO_PATIENT_ID, seed_demo_data
 from nightingale.domain.models import (
+    Actor,
     EntryOrigin,
     EntryType,
     Highlight,
@@ -8,6 +10,8 @@ from nightingale.domain.models import (
     SourceSpan,
     TimelineEntry,
 )
+from nightingale.repositories.memory import InMemoryCareNoteRepository
+from nightingale.services.care_notes import CareNoteService
 
 
 def test_highlight_pointer_resolves_to_timeline_span(repository, patient_id, clinic_id):
@@ -41,3 +45,21 @@ def test_highlight_pointer_resolves_to_timeline_span(repository, patient_id, cli
     source = repository.entries[highlight.provenance_pointer.entry_id]
     span = highlight.provenance_pointer
     assert source.content[span.start : span.end] == highlight.text
+
+
+def test_highlight_resolves_through_summary_to_original_source_span():
+    repository = InMemoryCareNoteRepository()
+    seed_demo_data(repository)
+    service = CareNoteService(repository)
+    actor = Actor(id=DEMO_CLINICIAN_ID, role=Role.CLINICIAN, clinic_id=DEMO_CLINIC_ID)
+    highlight = repository.list_highlights(DEMO_PATIENT_ID)[1]
+    summary = repository.get_entry(highlight.provenance_pointer.entry_id)
+
+    assert summary is not None
+    evidence = service.get_source_evidence(actor, DEMO_PATIENT_ID, summary.id)
+
+    pointer = summary.origin.source_pointer
+    assert pointer is not None
+    assert evidence.pointer == pointer
+    assert evidence.artifact.content[pointer.start : pointer.end] == evidence.excerpt
+    assert evidence.excerpt

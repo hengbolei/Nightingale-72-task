@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nightingale.api import routes
+from nightingale.core.identity import session_service
 from nightingale.domain.models import (
     Actor,
     HighlightCreateRequest,
@@ -132,16 +133,10 @@ def test_manual_note_and_highlight_api_round_trip(
     )
     monkeypatch.setattr(routes, "service", service)
     client = TestClient(app)
-    staff_headers = {
-        "x-actor-id": str(staff.id),
-        "x-actor-role": "staff",
-        "x-clinic-id": str(clinic_id),
-    }
-    clinician_headers = {
-        "x-actor-id": str(clinician.id),
-        "x-actor-role": "clinician",
-        "x-clinic-id": str(clinic_id),
-    }
+    staff_token, _ = session_service.issue(staff)
+    clinician_token, _ = session_service.issue(clinician)
+    staff_headers = {"authorization": f"Bearer {staff_token}"}
+    clinician_headers = {"authorization": f"Bearer {clinician_token}"}
 
     created_entry = client.post(
         f"/api/patients/{patient_id}/entries",
@@ -168,6 +163,7 @@ def test_manual_note_and_highlight_api_round_trip(
     )
     assert created_highlight.status_code == 201
     assert created_highlight.json()["text"] == phrase
+    assert created_highlight.json()["priority_factors"]
 
     audit = client.get(f"/api/patients/{patient_id}/audit", headers=clinician_headers)
     assert [event["operation"] for event in audit.json()] == [

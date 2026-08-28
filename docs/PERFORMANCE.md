@@ -1,6 +1,7 @@
 # Glance Warm-Path Performance
 
-Measured on 2026-08-27 with Python 3.12.10 on the local Windows development environment.
+Measured on 2026-08-28 with Python 3.12.10 on the local Windows development environment after
+enabling deterministic priority explanations and conflict detection.
 
 ## Method
 
@@ -16,10 +17,10 @@ Measured on 2026-08-27 with Python 3.12.10 on the local Windows development envi
 
 | Metric | Result |
 | --- | ---: |
-| Mean | 0.721 ms |
-| P50 | 0.685 ms |
-| P95 | 0.990 ms |
-| Maximum | 1.621 ms |
+| Mean | 1.242 ms |
+| P50 | 1.199 ms |
+| P95 | 1.535 ms |
+| Maximum | 2.509 ms |
 | Prototype target | ≤ 300 ms P95 |
 
 The measured prototype passes its warm-path target. This result does not include a network hop,
